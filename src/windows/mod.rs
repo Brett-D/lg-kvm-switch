@@ -3,6 +3,7 @@
 
 pub mod app;
 pub mod autostart;
+pub mod flyout;
 pub mod icon;
 pub mod nvapi;
 pub mod usb;

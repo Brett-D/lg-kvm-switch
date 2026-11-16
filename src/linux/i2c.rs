@@ -10,11 +10,12 @@ use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const I2C_SLAVE: u64 = 0x0703;
 const I2C_SLAVE_FORCE: u64 = 0x0706;
 const EDID_ADDR: u8 = 0x50;
+const DDC_GAP: Duration = Duration::from_millis(50);
 
 fn open_device(path: &Path, address: u8) -> io::Result<File> {
     let file = OpenOptions::new().read(true).write(true).open(path)?;
@@ -134,6 +135,7 @@ pub fn list_displays(settings: &Settings) -> Result<Vec<Display>, String> {
 pub struct I2cMonitor {
     settings: Settings,
     targets: Vec<PathBuf>,
+    last_transfer: Option<Instant>,
 }
 
 impl I2cMonitor {
@@ -141,10 +143,12 @@ impl I2cMonitor {
         Self {
             settings: settings.clone(),
             targets: Vec::new(),
+            last_transfer: None,
         }
     }
 
-    fn send(&mut self, packet: &[u8]) -> Result<(), String> {
+    /// Matching buses; never empty on success.
+    fn targets(&mut self) -> Result<Vec<PathBuf>, String> {
         if self.targets.is_empty() {
             self.targets = scan(&self.settings)?
                 .into_iter()
@@ -155,24 +159,56 @@ impl I2cMonitor {
         if self.targets.is_empty() {
             return Err("no matching monitor on any I2C bus (see `lg-kvm-switch monitors`)".into());
         }
+        Ok(self.targets.clone())
+    }
+
+    /// DDC/CI requires a pause between transactions.
+    fn pace(&mut self) {
+        if let Some(gap) = self
+            .last_transfer
+            .and_then(|at| DDC_GAP.checked_sub(at.elapsed()))
+        {
+            sleep(gap);
+        }
+    }
+
+    fn write_once(&mut self, packet: &[u8]) -> Result<(), String> {
+        let targets = self.targets()?;
+        self.pace();
         let mut error = None;
         let mut sent = false;
-        for path in &self.targets {
+        for path in &targets {
             match open_device(path, lg::DDC_ADDR).and_then(|mut d| d.write_all(packet)) {
                 Ok(()) => sent = true,
                 Err(e) => error = Some(format!("{}: {e}", path.display())),
             }
         }
+        self.last_transfer = Some(Instant::now());
         match (sent, error) {
             (true, _) => Ok(()),
             (false, error) => Err(error.unwrap_or_default()),
         }
     }
-}
 
-impl Monitor for I2cMonitor {
-    fn set_input(&mut self, input: u16) -> Result<(), String> {
-        let packet = lg::input_packet(input);
+    fn read_once(&mut self, vcp: u8) -> Result<u16, String> {
+        let path = self.targets()?.remove(0);
+        self.pace();
+        let mut reply = [0u8; 11];
+        let result = open_device(&path, lg::DDC_ADDR).and_then(|mut device| {
+            device.write_all(&lg::get_vcp_packet(vcp))?;
+            sleep(DDC_GAP);
+            device.read_exact(&mut reply)
+        });
+        self.last_transfer = Some(Instant::now());
+        result.map_err(|e| format!("{}: {e}", path.display()))?;
+        lg::parse_vcp_reply(&reply, vcp)
+            .ok_or_else(|| format!("no valid reply for VCP 0x{vcp:02X}"))
+    }
+
+    fn retry<T>(
+        &mut self,
+        mut op: impl FnMut(&mut Self) -> Result<T, String>,
+    ) -> Result<T, String> {
         let mut last_error = String::new();
         for attempt in 0..3 {
             if attempt > 0 {
@@ -180,11 +216,27 @@ impl Monitor for I2cMonitor {
                 self.targets.clear();
                 sleep(Duration::from_millis(300));
             }
-            match self.send(&packet) {
-                Ok(()) => return Ok(()),
+            match op(self) {
+                Ok(value) => return Ok(value),
                 Err(e) => last_error = e,
             }
         }
         Err(last_error)
+    }
+}
+
+impl Monitor for I2cMonitor {
+    fn set_input(&mut self, input: u16) -> Result<(), String> {
+        let packet = lg::input_packet(input);
+        self.retry(|m| m.write_once(&packet))
+    }
+
+    fn set_vcp(&mut self, vcp: u8, value: u16) -> Result<(), String> {
+        let packet = lg::set_vcp_packet(lg::STD_SOURCE_ADDR, vcp, value);
+        self.retry(|m| m.write_once(&packet))
+    }
+
+    fn get_vcp(&mut self, vcp: u8) -> Result<u16, String> {
+        self.retry(|m| m.read_once(vcp))
     }
 }
