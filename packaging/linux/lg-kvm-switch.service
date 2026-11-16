@@ -1,0 +1,10 @@
+[Unit]
+Description=Switch the LG monitor's input when the USB KVM moves
+
+[Service]
+ExecStart=%h/.local/bin/lg-kvm-switch run
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

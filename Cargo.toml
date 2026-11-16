@@ -1,0 +1,48 @@
+[package]
+name = "lg-kvm-switch"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+description = "Switch an LG monitor's input automatically when a USB KVM moves your keyboard and mouse"
+repository = "https://github.com/Brett-D/lg-kvm-switch"
+readme = "README.md"
+keywords = ["kvm", "ddc", "monitor", "lg", "input-switch"]
+categories = ["command-line-utilities", "hardware-support"]
+autobins = false
+
+[[bin]]
+name = "lg-kvm-switch"
+path = "src/main.rs"
+
+[[bin]]
+name = "lg-kvm-switch-tray"
+path = "src/bin/tray.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.61"
+features = [
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Properties",
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
