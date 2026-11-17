@@ -1,4 +1,5 @@
 use lg_kvm_switch::config::{self, Config, Settings};
+use lg_kvm_switch::controller::{control_name, Controller};
 use lg_kvm_switch::lg::{self, input_name};
 use lg_kvm_switch::monitor;
 use lg_kvm_switch::usb::{self, UsbId};
@@ -14,13 +15,18 @@ USAGE:
     lg-kvm-switch [--config <path>] <command>
 
 COMMANDS:
-    run               Watch the KVM and switch inputs (foreground)
-    switch <input>    Switch now: dp, usbc, hdmi1, hdmi2, or a code like 0xD0
-    devices           List connected USB devices (* = watched)
-    learn             Detect the KVM's devices by switching the KVM away
-    monitors          List monitors the program can reach
-    status            Show config, KVM position, and target monitor
-    autostart on|off  Start the tray app at Windows logon (Windows only)
+    run                  Watch the KVM and switch inputs (foreground)
+    switch <input>       Switch now: dp, usbc, hdmi1, hdmi2, or a code like 0xD0
+    pbp [on|off]         Show or set Picture-by-Picture (side by side)
+    brightness [0-100]   Show or set brightness
+    contrast [0-100]     Show or set contrast
+    volume [0-100]       Show or set volume
+    mute [on|off]        Show or set mute
+    devices              List connected USB devices (* = watched)
+    learn                Detect the KVM's devices by switching the KVM away
+    monitors             List monitors the program can reach
+    status               Show config, KVM position, and target monitor
+    autostart on|off     Start the tray app at Windows logon (Windows only)
 
 OPTIONS:
     -c, --config <path>   Config file (default: per-user config directory)
@@ -57,6 +63,11 @@ fn run() -> Result<(), String> {
         "version" => println!("lg-kvm-switch {}", env!("CARGO_PKG_VERSION")),
         "run" => run_watcher(config_arg, &path)?,
         "switch" => switch(&path, arg.ok_or("usage: lg-kvm-switch switch <input>")?)?,
+        "pbp" => pbp(&path, arg)?,
+        "brightness" => level(&path, lg::VCP_BRIGHTNESS, arg)?,
+        "contrast" => level(&path, lg::VCP_CONTRAST, arg)?,
+        "volume" => level(&path, lg::VCP_VOLUME, arg)?,
+        "mute" => mute(&path, arg)?,
         "devices" => devices(&path)?,
         "learn" => learn(&path)?,
         "monitors" => monitors(&path)?,
@@ -91,6 +102,95 @@ fn switch(path: &Path, input: &str) -> Result<(), String> {
     let input = lg::parse_input(input)?;
     monitor::open(&settings(path)?).set_input(input)?;
     println!("Switched to {}", input_name(input));
+    Ok(())
+}
+
+/// A controller that knows the KVM position, for commands that depend on it.
+fn controller(path: &Path) -> Result<Controller, String> {
+    let settings = settings(path)?;
+    let mut controller = Controller::new(settings.clone(), monitor::open(&settings));
+    if !settings.watch.is_empty() {
+        let here = controller.is_here(&usb::present_ids()?);
+        controller.assume_position(here);
+    }
+    Ok(controller)
+}
+
+fn parse_on_off(arg: &str) -> Result<bool, String> {
+    match arg.to_ascii_lowercase().as_str() {
+        "on" | "true" | "1" => Ok(true),
+        "off" | "false" | "0" => Ok(false),
+        _ => Err(format!("expected on or off, got '{arg}'")),
+    }
+}
+
+fn on_off(on: bool) -> &'static str {
+    if on {
+        "on"
+    } else {
+        "off"
+    }
+}
+
+fn pbp(path: &Path, arg: Option<&str>) -> Result<(), String> {
+    let mut controller = controller(path)?;
+    match arg {
+        None => {
+            let on = controller
+                .pbp()
+                .ok_or("the monitor did not report its layout")?;
+            println!("Split screen: {}", on_off(on));
+        }
+        Some(arg) => {
+            let on = parse_on_off(arg)?;
+            controller.set_pbp(on)?;
+            let s = controller.settings();
+            if on {
+                println!(
+                    "Side by side on: {} left, {} right",
+                    input_name(s.pbp_left),
+                    input_name(s.pbp_right)
+                );
+            } else {
+                println!("Split screen off");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn level(path: &Path, vcp: u8, arg: Option<&str>) -> Result<(), String> {
+    let mut monitor = monitor::open(&settings(path)?);
+    let name = control_name(vcp);
+    match arg {
+        None => println!("{name}: {}", monitor.get_vcp(vcp)?),
+        Some(arg) => {
+            let value: u16 = arg
+                .parse()
+                .ok()
+                .filter(|v| *v <= 100)
+                .ok_or_else(|| format!("{name} must be 0-100, got '{arg}'"))?;
+            monitor.set_vcp(vcp, value)?;
+            println!("{name}: {value}");
+        }
+    }
+    Ok(())
+}
+
+fn mute(path: &Path, arg: Option<&str>) -> Result<(), String> {
+    let mut monitor = monitor::open(&settings(path)?);
+    match arg {
+        None => {
+            let muted = monitor.get_vcp(lg::VCP_MUTE)? == lg::MUTE_ON;
+            println!("mute: {}", on_off(muted));
+        }
+        Some(arg) => {
+            let on = parse_on_off(arg)?;
+            let value = if on { lg::MUTE_ON } else { lg::MUTE_OFF };
+            monitor.set_vcp(lg::VCP_MUTE, value)?;
+            println!("mute: {}", on_off(on));
+        }
+    }
     Ok(())
 }
 
@@ -261,6 +361,20 @@ fn status(path: &Path) -> Result<(), String> {
                     selected.join("; ")
                 }
             );
+            if !selected.is_empty() {
+                let mut monitor = monitor::open(&settings);
+                let shown = monitor
+                    .get_vcp(lg::LG_ACTIVE_INPUT_VCP)
+                    .ok()
+                    .and_then(lg::active_input)
+                    .map_or_else(|| "unknown".to_string(), input_name);
+                let split = match monitor.get_vcp(lg::LG_PBP_VCP) {
+                    Ok(lg::PBP_OFF) => " (full screen)".to_string(),
+                    Ok(layout) => format!(" ({}, main picture)", lg::layout_name(layout)),
+                    Err(_) => String::new(),
+                };
+                println!("Showing:   {shown}{split}");
+            }
         }
         Err(e) => println!("Monitor:   {e}"),
     }

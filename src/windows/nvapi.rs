@@ -13,7 +13,7 @@ use std::ffi::c_void;
 use std::mem::{size_of, transmute};
 use std::ptr::null_mut;
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 
 type GpuHandle = *mut c_void;
@@ -29,7 +29,9 @@ const ID_ENUM_PHYSICAL_GPUS: u32 = 0xE5AC_921F;
 const ID_GET_CONNECTED_OUTPUTS: u32 = 0x1730_BFC9;
 const ID_GET_EDID: u32 = 0x37D3_2E69;
 const ID_I2C_WRITE: u32 = 0xE812_EB07;
+const ID_I2C_READ: u32 = 0x2FDE_12C5;
 const MAX_GPUS: usize = 64;
+const DDC_GAP: Duration = Duration::from_millis(50);
 
 #[cfg(target_pointer_width = "64")]
 const DLL: &str = "nvapi64.dll";
@@ -93,6 +95,7 @@ pub struct NvApi {
     connected_outputs: ConnectedOutputsFn,
     get_edid: GetEdidFn,
     i2c_write: I2cFn,
+    i2c_read: I2cFn,
 }
 
 impl NvApi {
@@ -134,6 +137,7 @@ impl NvApi {
                 )?),
                 get_edid: transmute::<*mut c_void, GetEdidFn>(get(ID_GET_EDID)?),
                 i2c_write: transmute::<*mut c_void, I2cFn>(get(ID_I2C_WRITE)?),
+                i2c_read: transmute::<*mut c_void, I2cFn>(get(ID_I2C_READ)?),
             })
         }
     }
@@ -177,9 +181,25 @@ impl NvApi {
     }
 
     /// Writes a DDC/CI packet (starting with the source address) to the
+    /// Writes a DDC/CI packet (starting with the source address) to the
     /// monitor on `output`.
     pub fn write(&self, output: &NvOutput, packet: &[u8]) -> Result<(), String> {
         let mut data = packet.to_vec();
+        self.transfer(self.i2c_write, output, &mut data, "NvAPI_I2CWrite")
+    }
+
+    /// Reads a DDC/CI reply from the monitor on `output` into `buffer`.
+    pub fn read(&self, output: &NvOutput, buffer: &mut [u8]) -> Result<(), String> {
+        self.transfer(self.i2c_read, output, buffer, "NvAPI_I2CRead")
+    }
+
+    fn transfer(
+        &self,
+        function: I2cFn,
+        output: &NvOutput,
+        data: &mut [u8],
+        name: &str,
+    ) -> Result<(), String> {
         let mut info = NvI2cInfo {
             version: struct_version::<NvI2cInfo>(3),
             display_mask: output.mask,
@@ -196,10 +216,7 @@ impl NvApi {
         };
         let gpu = *self.gpus.get(output.gpu).ok_or("GPU disappeared")?;
         // SAFETY: `info` points at `data`, which outlives the call.
-        check(
-            unsafe { (self.i2c_write)(gpu, &mut info) },
-            "NvAPI_I2CWrite",
-        )
+        check(unsafe { function(gpu, &mut info) }, name)
     }
 }
 
@@ -238,6 +255,7 @@ pub struct NvMonitor {
     /// Last outputs that matched, used if the monitor briefly stops
     /// reporting as connected after switching away.
     last_targets: Vec<NvOutput>,
+    last_transfer: Option<Instant>,
 }
 
 impl NvMonitor {
@@ -246,10 +264,12 @@ impl NvMonitor {
             settings: settings.clone(),
             api: None,
             last_targets: Vec::new(),
+            last_transfer: None,
         }
     }
 
-    fn send(&mut self, packet: &[u8]) -> Result<(), String> {
+    /// Matching outputs; never empty on success. Loads NVAPI if needed.
+    fn targets(&mut self) -> Result<Vec<NvOutput>, String> {
         if self.api.is_none() {
             self.api = Some(NvApi::load()?);
         }
@@ -263,6 +283,24 @@ impl NvMonitor {
                 "no matching monitor on any NVIDIA output (see `lg-kvm-switch monitors`)".into(),
             );
         }
+        self.last_targets.clone_from(&targets);
+        Ok(targets)
+    }
+
+    /// DDC/CI requires a pause between transactions.
+    fn pace(&mut self) {
+        if let Some(gap) = self
+            .last_transfer
+            .and_then(|at| DDC_GAP.checked_sub(at.elapsed()))
+        {
+            sleep(gap);
+        }
+    }
+
+    fn write_once(&mut self, packet: &[u8]) -> Result<(), String> {
+        let targets = self.targets()?;
+        self.pace();
+        let api = self.api.as_ref().expect("loaded by targets()");
         let mut error = None;
         let mut sent = false;
         for target in &targets {
@@ -271,17 +309,32 @@ impl NvMonitor {
                 Err(e) => error = Some(format!("{}: {e}", target.location())),
             }
         }
-        self.last_targets = targets;
+        self.last_transfer = Some(Instant::now());
         match (sent, error) {
             (true, _) => Ok(()),
             (false, error) => Err(error.unwrap_or_default()),
         }
     }
-}
 
-impl Monitor for NvMonitor {
-    fn set_input(&mut self, input: u16) -> Result<(), String> {
-        let packet = lg::input_packet(input);
+    fn read_once(&mut self, vcp: u8) -> Result<u16, String> {
+        let target = self.targets()?.remove(0);
+        self.pace();
+        let api = self.api.as_ref().expect("loaded by targets()");
+        let mut reply = [0u8; 11];
+        let result = api.write(&target, &lg::get_vcp_packet(vcp)).and_then(|()| {
+            sleep(DDC_GAP);
+            api.read(&target, &mut reply)
+        });
+        self.last_transfer = Some(Instant::now());
+        result?;
+        lg::parse_vcp_reply(&reply, vcp)
+            .ok_or_else(|| format!("no valid reply for VCP 0x{vcp:02X}"))
+    }
+
+    fn retry<T>(
+        &mut self,
+        mut op: impl FnMut(&mut Self) -> Result<T, String>,
+    ) -> Result<T, String> {
         let mut last_error = String::new();
         for attempt in 0..3 {
             if attempt > 0 {
@@ -289,12 +342,28 @@ impl Monitor for NvMonitor {
                 self.api = None;
                 sleep(Duration::from_millis(300));
             }
-            match self.send(&packet) {
-                Ok(()) => return Ok(()),
+            match op(self) {
+                Ok(value) => return Ok(value),
                 Err(e) => last_error = e,
             }
         }
         Err(last_error)
+    }
+}
+
+impl Monitor for NvMonitor {
+    fn set_input(&mut self, input: u16) -> Result<(), String> {
+        let packet = lg::input_packet(input);
+        self.retry(|m| m.write_once(&packet))
+    }
+
+    fn set_vcp(&mut self, vcp: u8, value: u16) -> Result<(), String> {
+        let packet = lg::set_vcp_packet(lg::STD_SOURCE_ADDR, vcp, value);
+        self.retry(|m| m.write_once(&packet))
+    }
+
+    fn get_vcp(&mut self, vcp: u8) -> Result<u16, String> {
+        self.retry(|m| m.read_once(vcp))
     }
 }
 

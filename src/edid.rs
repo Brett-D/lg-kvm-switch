@@ -41,8 +41,8 @@ impl EdidInfo {
     }
 
     pub fn matches(&self, vendor: Option<&str>, product: Option<u16>) -> bool {
-        vendor.map_or(true, |v| self.vendor.eq_ignore_ascii_case(v))
-            && product.map_or(true, |p| self.product == p)
+        vendor.is_none_or(|v| self.vendor.eq_ignore_ascii_case(v))
+            && product.is_none_or(|p| self.product == p)
     }
 
     pub fn describe(&self) -> String {

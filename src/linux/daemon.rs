@@ -27,9 +27,12 @@ pub fn run(config_path: &Path) -> Result<(), String> {
     let (poll, debounce) = (settings.poll, settings.debounce);
     let mut controller = Controller::new(settings.clone(), Box::new(I2cMonitor::new(&settings)));
 
-    // Act only once the position has been stable for the debounce period.
+    // Act once per KVM position, after it has been stable for the debounce
+    // period; repeat only to retry a failed switch, or one waiting for split
+    // screen to end.
     let mut seen: Option<bool> = None;
     let mut changed_at = Instant::now();
+    let mut handled: Option<bool> = None;
     let mut retry_at: Option<Instant> = None;
     loop {
         match usb::present_ids() {
@@ -40,9 +43,13 @@ pub fn run(config_path: &Path) -> Result<(), String> {
                     changed_at = Instant::now();
                 }
                 let settled = changed_at.elapsed() >= debounce;
-                if settled && retry_at.map_or(true, |at| Instant::now() >= at) {
+                let due = handled != Some(here) || retry_at.is_some_and(|at| Instant::now() >= at);
+                if settled && due {
+                    handled = Some(here);
                     retry_at = match controller.update(here) {
-                        Outcome::Failed(_) => Some(Instant::now() + RETRY),
+                        Outcome::Failed(_) | Outcome::PictureByPicture => {
+                            Some(Instant::now() + RETRY)
+                        }
                         _ => None,
                     };
                 }

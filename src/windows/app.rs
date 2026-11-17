@@ -1,15 +1,18 @@
 //! The Windows watcher: a hidden window that receives USB and power
-//! notifications, plus an optional notification-area icon and menu.
+//! notifications, plus an optional notification-area icon with a flyout
+//! (left click) and a menu (right click).
 
+use super::flyout::{self, Action, Flyout, Model, Slider, Tile};
 use super::{autostart, icon, log_path, wide};
 use crate::config::{self, Config};
-use crate::controller::{Controller, Outcome};
-use crate::lg::input_name;
+use crate::controller::{Controller, Levels, Outcome, Step, SETTLE};
+use crate::lg::{self, input_name};
 use crate::log;
 use crate::{monitor, usb};
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::ffi::c_void;
-use std::mem::{size_of, zeroed};
+use std::mem::{size_of, transmute, zeroed};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -17,8 +20,11 @@ use windows_sys::core::GUID;
 use windows_sys::Win32::Foundation::{
     GetLastError, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, WPARAM,
 };
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::System::Threading::CreateMutexW;
+use windows_sys::Win32::UI::HiDpi::{
+    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+};
 use windows_sys::Win32::UI::Shell::{
     ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
     NIM_MODIFY, NOTIFYICONDATAW,
@@ -28,18 +34,31 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetCursorPos, GetMessageW, KillTimer, MessageBoxW, PostMessageW,
     PostQuitMessage, RegisterClassW, RegisterDeviceNotificationW, RegisterWindowMessageW,
     SetForegroundWindow, SetTimer, TrackPopupMenu, TranslateMessage, DBT_DEVTYP_DEVICEINTERFACE,
-    DEVICE_NOTIFY_WINDOW_HANDLE, DEV_BROADCAST_DEVICEINTERFACE_W, HICON, MB_ICONERROR, MB_OK,
-    MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, PBT_APMRESUMEAUTOMATIC, SW_SHOWNORMAL,
-    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_DESTROY, WM_DEVICECHANGE,
-    WM_LBUTTONUP, WM_NULL, WM_POWERBROADCAST, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW,
-    WS_OVERLAPPED,
+    DEVICE_NOTIFY_WINDOW_HANDLE, DEV_BROADCAST_DEVICEINTERFACE_W, HICON, HMENU, MB_ICONERROR,
+    MB_OK, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, PBT_APMRESUMEAUTOMATIC,
+    SW_SHOWNORMAL, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_DESTROY,
+    WM_DEVICECHANGE, WM_LBUTTONUP, WM_NULL, WM_POWERBROADCAST, WM_RBUTTONUP, WM_SETTINGCHANGE,
+    WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
 };
 
 const WM_TRAY: u32 = WM_APP + 1;
+const WM_SHOW_MENU: u32 = WM_APP + 2;
+const WM_SHOW_SPLIT_MENU: u32 = WM_APP + 3;
 const SCAN_TIMER: usize = 1;
+/// Runs the next step of a multi-step monitor change.
+const ACTION_TIMER: usize = 2;
+const REFRESH_TIMER: usize = 3;
 const RETRY_MS: u32 = 5_000;
 const RESUME_MS: u32 = 2_000;
+const STARTUP_REFRESH_MS: u32 = 1_500;
+const OPEN_REFRESH_MS: u32 = 250;
+/// Delay before the first step, so the flyout repaints first.
+const FIRST_STEP_MS: u32 = 30;
+/// How long to put off a KVM check while a monitor change is running.
+const BUSY_RETRY_MS: u32 = 1_000;
 const USB_DEVICE_INTERFACE: GUID = GUID::from_u128(0xA5DCBF10_6530_11D2_901F_00C04FB951ED);
+/// Monitor controls behind the flyout's sliders, top to bottom.
+const SLIDER_VCPS: [u8; 3] = [lg::VCP_BRIGHTNESS, lg::VCP_CONTRAST, lg::VCP_VOLUME];
 
 const CMD_LOCAL: usize = 10;
 const CMD_REMOTE: usize = 11;
@@ -49,6 +68,11 @@ const CMD_EDIT: usize = 14;
 const CMD_RELOAD: usize = 15;
 const CMD_LOG: usize = 16;
 const CMD_EXIT: usize = 17;
+const CMD_PBP: usize = 18;
+const CMD_SWAP: usize = 19;
+/// Split-screen menu commands: base + index into `lg::INPUTS`.
+const CMD_LEFT: usize = 200;
+const CMD_RIGHT: usize = 300;
 
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
@@ -71,6 +95,13 @@ enum State {
     Problem = 3,
 }
 
+/// A multi-step monitor change, run one step per timer tick so the UI stays
+/// responsive while the monitor settles.
+struct Job {
+    steps: VecDeque<Step>,
+    action: String,
+}
+
 struct App {
     hwnd: HWND,
     tray: bool,
@@ -79,6 +110,11 @@ struct App {
     controller: Option<Controller>,
     problem: Option<String>,
     icons: [HICON; 4],
+    flyout: Option<Flyout>,
+    /// Last known monitor settings; read in the background so the flyout
+    /// opens instantly.
+    levels: Levels,
+    job: Option<Job>,
 }
 
 enum MenuItem {
@@ -89,11 +125,21 @@ enum MenuItem {
         checked: bool,
         enabled: bool,
     },
+    Submenu {
+        label: String,
+        items: Vec<MenuItem>,
+    },
+}
+
+/// A choice from the split-screen menu.
+enum SplitChoice {
+    Left(u16),
+    Right(u16),
 }
 
 impl App {
     fn load_config(&mut self) {
-        let auto = self.controller.as_ref().map_or(true, |c| c.auto);
+        let auto = self.controller.as_ref().is_none_or(|c| c.auto);
         let result = (|| {
             if !self.config_path.exists() {
                 config::save(&self.config_path, &Config::default())?;
@@ -139,11 +185,27 @@ impl App {
 
     /// Checks the KVM position. Returns a delay if a retry is needed.
     fn scan(&mut self) -> Option<u32> {
+        if self.job.is_some() {
+            return Some(BUSY_RETRY_MS);
+        }
         let controller = self.controller.as_mut()?;
         let retry = match usb::present_ids() {
             Ok(present) => {
                 let here = controller.is_here(&present);
-                matches!(controller.update(here), Outcome::Failed(_))
+                match controller.update(here) {
+                    Outcome::Failed(_) => true,
+                    // Check again in case split screen is turned off from
+                    // the monitor's menu.
+                    Outcome::PictureByPicture => {
+                        self.levels.pbp = Some(true);
+                        true
+                    }
+                    Outcome::Switched(_) | Outcome::AlreadyShown(_) => {
+                        self.levels.pbp = Some(false);
+                        false
+                    }
+                    _ => false,
+                }
             }
             Err(e) => {
                 log!("Could not list USB devices: {e}");
@@ -165,6 +227,29 @@ impl App {
             return (State::Problem, format!("Error: {e}"));
         }
         let s = c.settings();
+        if self.levels.pbp == Some(true) {
+            let state = if c.kvm_here == Some(false) {
+                State::Away
+            } else {
+                State::Here
+            };
+            let left = c.main_input().unwrap_or(s.pbp_left);
+            let right = if left == s.pbp_left {
+                s.pbp_right
+            } else {
+                s.pbp_left
+            };
+            let layout = self.levels.layout.unwrap_or(lg::PBP_SIDE_BY_SIDE);
+            return (
+                state,
+                format!(
+                    "{}: {} | {}",
+                    lg::layout_name(layout),
+                    input_name(left),
+                    input_name(right)
+                ),
+            );
+        }
         match (c.auto, c.kvm_here) {
             (false, _) => (State::Idle, "Automatic switching paused".into()),
             (true, None) => (State::Idle, "Checking USB devices…".into()),
@@ -204,10 +289,17 @@ impl App {
         }
     }
 
-    fn refresh(&self) {
+    /// Updates the tray icon and, if open, the flyout.
+    fn refresh(&mut self) {
         if self.tray {
             // SAFETY: as above.
             unsafe { Shell_NotifyIconW(NIM_MODIFY, &self.notify_data()) };
+        }
+        if self.flyout.as_ref().is_some_and(Flyout::is_visible) {
+            let model = self.flyout_model();
+            if let Some(flyout) = self.flyout.as_mut() {
+                flyout.update(model);
+            }
         }
     }
 
@@ -215,6 +307,363 @@ impl App {
         if self.tray {
             // SAFETY: as above.
             unsafe { Shell_NotifyIconW(NIM_DELETE, &self.notify_data()) };
+        }
+    }
+
+    fn refresh_levels(&mut self) {
+        if let Some(c) = self.controller.as_mut() {
+            self.levels = c.levels();
+        }
+        self.refresh();
+    }
+
+    fn flyout_model(&self) -> Model {
+        let pbp = self.levels.pbp == Some(true);
+        let (ready, auto, main, local, remote) = match &self.controller {
+            Some(c) => (
+                true,
+                c.auto,
+                c.main_input(),
+                c.settings().local_input,
+                c.settings().remote_input,
+            ),
+            None => (false, false, None, 0, 0),
+        };
+        let tile = |glyph, label: &str, on| Tile {
+            glyph,
+            label: label.into(),
+            on,
+            enabled: ready,
+            has_menu: false,
+        };
+        let muted = self.levels.muted == Some(true);
+        let slider = |glyph, label: &str, value, icon_button| Slider {
+            glyph,
+            label: label.into(),
+            value,
+            icon_button,
+        };
+        // PIP can only be turned on from the monitor's menu; show it if it is.
+        let split_label = if pbp && self.levels.layout == Some(lg::PBP_PIP) {
+            "Pic in pic"
+        } else {
+            "Side by side"
+        };
+        Model {
+            tiles: vec![
+                tile(
+                    flyout::GLYPH_THIS_PC,
+                    "This PC",
+                    ready && !pbp && main == Some(local),
+                ),
+                tile(
+                    flyout::GLYPH_OTHER_PC,
+                    "Other PC",
+                    ready && !pbp && main == Some(remote),
+                ),
+                Tile {
+                    has_menu: ready,
+                    ..tile(flyout::GLYPH_SIDE_BY_SIDE, split_label, pbp)
+                },
+                Tile {
+                    enabled: ready && pbp,
+                    ..tile(flyout::GLYPH_SWAP, "Swap sides", false)
+                },
+                tile(flyout::GLYPH_AUTO, "Auto switch", auto),
+            ],
+            sliders: vec![
+                slider(
+                    flyout::GLYPH_BRIGHTNESS,
+                    "Brightness",
+                    self.levels.brightness,
+                    false,
+                ),
+                slider(
+                    flyout::GLYPH_CONTRAST,
+                    "Contrast",
+                    self.levels.contrast,
+                    false,
+                ),
+                slider(
+                    if muted {
+                        flyout::GLYPH_MUTED
+                    } else {
+                        flyout::GLYPH_VOLUME
+                    },
+                    if muted { "Volume (muted)" } else { "Volume" },
+                    self.levels.volume,
+                    self.levels.muted.is_some(),
+                ),
+            ],
+            status: self.status().1,
+        }
+    }
+
+    /// Opens or closes the flyout. `None` if there is no flyout; otherwise
+    /// whether it opened.
+    fn toggle_flyout(&mut self) -> Option<bool> {
+        let model = self.flyout_model();
+        let flyout = self.flyout.as_mut()?;
+        if flyout.is_visible() {
+            if let Some(action) = flyout.hide() {
+                self.flyout_action(action);
+            }
+            return Some(false);
+        }
+        if flyout.just_closed() {
+            return Some(false);
+        }
+        flyout.show(model);
+        Some(true)
+    }
+
+    fn flyout_message(&mut self, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+        let (result, action) = self.flyout.as_mut()?.handle(msg, wparam, lparam);
+        if let Some(action) = action {
+            self.flyout_action(action);
+        }
+        result
+    }
+
+    fn flyout_action(&mut self, action: Action) {
+        match action {
+            Action::Tile(0) => self.show(true),
+            Action::Tile(1) => self.show(false),
+            Action::Tile(2) => self.toggle_pbp(),
+            Action::Tile(3) => self.swap_sides(),
+            Action::Tile(4) => {
+                self.toggle_auto();
+                schedule_scan(self.hwnd, 10);
+            }
+            Action::Tile(_) => {}
+            Action::TileMenu(_) => {
+                // SAFETY: posting to our own window; the menu opens outside
+                // this borrow of the app state.
+                unsafe { PostMessageW(self.hwnd, WM_SHOW_SPLIT_MENU, 0, 0) };
+            }
+            Action::SetLevel(i, value) => self.set_level(i, value),
+            Action::Icon(_) => self.toggle_mute(),
+            Action::Settings => {
+                if let Some(Action::SetLevel(i, value)) =
+                    self.flyout.as_mut().and_then(Flyout::hide)
+                {
+                    self.set_level(i, value);
+                }
+                // SAFETY: posting to our own window; the menu opens outside
+                // this borrow of the app state.
+                unsafe { PostMessageW(self.hwnd, WM_SHOW_MENU, 0, 0) };
+            }
+        }
+        self.refresh();
+    }
+
+    /// Shows this or the other computer full screen.
+    fn show(&mut self, local: bool) {
+        if self.busy() {
+            return;
+        }
+        let Some(c) = self.controller.as_mut() else {
+            return;
+        };
+        let s = c.settings();
+        let input = if local { s.local_input } else { s.remote_input };
+        let steps = c.show_steps(input);
+        self.start_job(steps, format!("switch to {} (manual)", input_name(input)));
+    }
+
+    fn toggle_pbp(&mut self) {
+        if self.busy() {
+            return;
+        }
+        let Some(c) = self.controller.as_mut() else {
+            return;
+        };
+        let on = self.levels.pbp != Some(true);
+        let (steps, action) = (c.pbp_steps(on), c.pbp_description(on));
+        // Show the new state right away; the change takes a few seconds.
+        self.levels.pbp = Some(on);
+        self.start_job(steps, action);
+    }
+
+    fn swap_sides(&mut self) {
+        if self.levels.pbp != Some(true) || self.busy() {
+            return;
+        }
+        let Some(c) = self.controller.as_mut() else {
+            return;
+        };
+        let (step, left) = c.swap_pbp();
+        self.start_job(
+            vec![step],
+            format!("swap sides ({} now on the left)", input_name(left)),
+        );
+        self.save_split();
+    }
+
+    /// Applies a choice from the split-screen menu and saves it.
+    fn choose_split(&mut self, choice: SplitChoice) {
+        if self.busy() {
+            return;
+        }
+        let Some(c) = self.controller.as_mut() else {
+            return;
+        };
+        let s = c.settings();
+        let (mut left, mut right) = (s.pbp_left, s.pbp_right);
+        // Picking the input already on the other side swaps the two.
+        match choice {
+            SplitChoice::Left(input) => {
+                if input == right {
+                    right = left;
+                }
+                left = input;
+            }
+            SplitChoice::Right(input) => {
+                if input == left {
+                    left = right;
+                }
+                right = input;
+            }
+        }
+        let steps = c.set_split(left, right);
+        let action = format!(
+            "set split screen to {} left, {} right",
+            input_name(left),
+            input_name(right)
+        );
+        if steps.is_empty() {
+            log!(
+                "Split screen will use {}",
+                &action["set split screen to ".len()..]
+            );
+        }
+        self.start_job(steps, action);
+        self.save_split();
+    }
+
+    /// Saves the split-screen sides so they're used next time.
+    fn save_split(&self) {
+        let Some(c) = &self.controller else {
+            return;
+        };
+        let s = c.settings();
+        let saved = config::load(&self.config_path).and_then(|mut config| {
+            config.pbp_left = Some(lg::input_key(s.pbp_left));
+            config.pbp_right = Some(lg::input_key(s.pbp_right));
+            config::save(&self.config_path, &config)
+        });
+        if let Err(e) = saved {
+            log!("Could not save the split-screen settings: {e}");
+        }
+    }
+
+    /// The split-screen options, for the flyout tile's right-click menu and
+    /// the tray menu.
+    fn split_menu(&self) -> Vec<MenuItem> {
+        let Some(c) = &self.controller else {
+            return Vec::new();
+        };
+        let s = c.settings();
+        let header = |label: &str| MenuItem::Item {
+            id: 0,
+            label: label.into(),
+            checked: false,
+            enabled: false,
+        };
+        let choice = |id, label: &str, checked| MenuItem::Item {
+            id,
+            label: label.into(),
+            checked,
+            enabled: true,
+        };
+        let mut items = vec![header("Left side")];
+        for (i, (_, code, label)) in lg::INPUTS.iter().enumerate() {
+            items.push(choice(CMD_LEFT + i, label, s.pbp_left == *code));
+        }
+        items.push(MenuItem::Separator);
+        items.push(header("Right side"));
+        for (i, (_, code, label)) in lg::INPUTS.iter().enumerate() {
+            items.push(choice(CMD_RIGHT + i, label, s.pbp_right == *code));
+        }
+        items.push(MenuItem::Separator);
+        items.push(MenuItem::Item {
+            id: CMD_SWAP,
+            label: "Swap sides".into(),
+            checked: false,
+            enabled: self.levels.pbp == Some(true),
+        });
+        items.push(header("Picture in picture: monitor menu"));
+        items
+    }
+
+    /// Whether a multi-step change is still running. Other monitor changes
+    /// are refused until it finishes, so they can't interleave with it.
+    fn busy(&self) -> bool {
+        if self.job.is_some() {
+            log!("Still applying the last change; try again in a few seconds");
+        }
+        self.job.is_some()
+    }
+
+    fn start_job(&mut self, steps: Vec<Step>, action: String) {
+        if self.job.is_some() || steps.is_empty() {
+            return;
+        }
+        self.job = Some(Job {
+            steps: steps.into(),
+            action,
+        });
+        set_timer(self.hwnd, ACTION_TIMER, FIRST_STEP_MS);
+    }
+
+    /// Runs the next step of the current job. Returns the delay before the
+    /// following step, if any.
+    fn run_job_step(&mut self) -> Option<u32> {
+        let Some(c) = self.controller.as_mut() else {
+            // The config was reloaded with an error; drop the change.
+            self.job = None;
+            return None;
+        };
+        let job = self.job.as_mut()?;
+        let step = job.steps.pop_front()?;
+        let result = c.run_step(step);
+        if result.is_ok() && !job.steps.is_empty() {
+            return Some(SETTLE.as_millis() as u32);
+        }
+        c.record(&result, &job.action);
+        self.levels.pbp = c.pbp();
+        self.job = None;
+        if result.is_err() {
+            // The controller retries the KVM position if the job left it
+            // unhandled, e.g. split screen went off but the input didn't change.
+            schedule_scan(self.hwnd, RETRY_MS);
+        }
+        self.refresh();
+        None
+    }
+
+    fn set_level(&mut self, slider: usize, value: u16) {
+        let (Some(&vcp), Some(c)) = (SLIDER_VCPS.get(slider), self.controller.as_mut()) else {
+            return;
+        };
+        if c.set_level(vcp, value).is_ok() {
+            let level = match slider {
+                0 => &mut self.levels.brightness,
+                1 => &mut self.levels.contrast,
+                _ => &mut self.levels.volume,
+            };
+            *level = Some(value);
+        }
+    }
+
+    fn toggle_mute(&mut self) {
+        let Some(c) = self.controller.as_mut() else {
+            return;
+        };
+        let mute = self.levels.muted != Some(true);
+        let value = if mute { lg::MUTE_ON } else { lg::MUTE_OFF };
+        if c.set_level(lg::VCP_MUTE, value).is_ok() {
+            self.levels.muted = Some(mute);
         }
     }
 
@@ -236,11 +685,18 @@ impl App {
             },
         );
         let auto = self.controller.as_ref().is_some_and(|c| c.auto);
+        let pbp = self.levels.pbp == Some(true);
         vec![
             item(0, self.status().1, false, false),
             MenuItem::Separator,
             item(CMD_LOCAL, format!("Show {local}"), false, ready),
             item(CMD_REMOTE, format!("Show {remote}"), false, ready),
+            item(CMD_PBP, "Split screen (side by side)".into(), pbp, ready),
+            item(CMD_SWAP, "Swap sides".into(), false, ready && pbp),
+            MenuItem::Submenu {
+                label: "Split screen options".into(),
+                items: self.split_menu(),
+            },
             MenuItem::Separator,
             item(CMD_AUTO, "Switch automatically".into(), auto, ready),
             item(
@@ -256,15 +712,6 @@ impl App {
             MenuItem::Separator,
             item(CMD_EXIT, "Exit".into(), false, true),
         ]
-    }
-
-    fn show(&mut self, local: bool) {
-        if let Some(c) = self.controller.as_mut() {
-            let s = c.settings();
-            let input = if local { s.local_input } else { s.remote_input };
-            let _ = c.show(input);
-        }
-        self.refresh();
     }
 
     fn toggle_auto(&mut self) {
@@ -298,7 +745,8 @@ impl App {
 }
 
 /// Runs the watcher until the window closes. With `tray`, shows the
-/// notification-area icon and logs to a file; otherwise logs to stdout.
+/// notification-area icon and flyout and logs to a file; otherwise logs to
+/// stdout.
 pub fn run(config_path: Option<PathBuf>, tray: bool) -> Result<(), String> {
     let custom_config = config_path.is_some();
     let config_path = config_path.unwrap_or_else(config::default_path);
@@ -312,6 +760,10 @@ pub fn run(config_path: Option<PathBuf>, tray: bool) -> Result<(), String> {
             log!("Already running; exiting");
             return Ok(());
         }
+        // SAFETY: called before any window exists. Sharp text on every
+        // monitor; the flyout scales itself.
+        unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        follow_dark_mode_in_menus();
     }
 
     // SAFETY: standard Win32 window setup; all strings outlive the calls.
@@ -351,6 +803,13 @@ pub fn run(config_path: Option<PathBuf>, tray: bool) -> Result<(), String> {
         register_usb_notifications(hwnd);
         hwnd
     };
+    let flyout = if tray {
+        Flyout::create(Some(flyout_proc))
+            .map_err(|e| log!("Flyout unavailable, using the menu instead: {e}"))
+            .ok()
+    } else {
+        None
+    };
 
     let mut app = App {
         hwnd,
@@ -365,12 +824,18 @@ pub fn run(config_path: Option<PathBuf>, tray: bool) -> Result<(), String> {
             icon::monitor_icon(0x9A9A9A),
             icon::monitor_icon(0xE5484D),
         ],
+        flyout,
+        levels: Levels::default(),
+        job: None,
     };
     log!("Started (config: {})", app.config_path.display());
     app.add_tray_icon();
     app.load_config();
     APP.with(|cell| *cell.borrow_mut() = Some(app));
     schedule_scan(hwnd, 10);
+    if tray {
+        set_timer(hwnd, REFRESH_TIMER, STARTUP_REFRESH_MS);
+    }
 
     // SAFETY: standard message loop.
     unsafe {
@@ -415,10 +880,49 @@ unsafe fn register_usb_notifications(hwnd: HWND) {
     }
 }
 
+fn set_timer(hwnd: HWND, id: usize, delay_ms: u32) {
+    // SAFETY: timer on our own window.
+    unsafe { SetTimer(hwnd, id, delay_ms.max(10), None) };
+}
+
+/// uxtheme's `SetPreferredAppMode` (ordinal 135) and `FlushMenuThemes`
+/// (ordinal 136). Undocumented, but used by Windows' own apps since Windows
+/// 10 1903; without them, Win32 menus are always light.
+fn uxtheme_function(ordinal: usize) -> Option<unsafe extern "system" fn() -> isize> {
+    // SAFETY: uxtheme is a system DLL; ordinals are passed as the low word
+    // of the name pointer, as GetProcAddress documents.
+    unsafe {
+        let library = LoadLibraryW(wide("uxtheme.dll").as_ptr());
+        if library.is_null() {
+            return None;
+        }
+        GetProcAddress(library, ordinal as *const u8)
+    }
+}
+
+/// Makes the app's menus follow the system light/dark setting.
+fn follow_dark_mode_in_menus() {
+    const ALLOW_DARK: i32 = 1;
+    if let Some(function) = uxtheme_function(135) {
+        // SAFETY: SetPreferredAppMode takes one enum argument.
+        unsafe {
+            let set_preferred_app_mode: unsafe extern "system" fn(i32) -> i32 = transmute(function);
+            set_preferred_app_mode(ALLOW_DARK);
+        }
+    }
+    refresh_menu_theme();
+}
+
+fn refresh_menu_theme() {
+    if let Some(flush_menu_themes) = uxtheme_function(136) {
+        // SAFETY: FlushMenuThemes takes no arguments.
+        unsafe { flush_menu_themes() };
+    }
+}
+
 /// (Re)starts the scan timer, so bursts of USB events collapse into one scan.
 fn schedule_scan(hwnd: HWND, delay_ms: u32) {
-    // SAFETY: timer on our own window.
-    unsafe { SetTimer(hwnd, SCAN_TIMER, delay_ms.max(10), None) };
+    set_timer(hwnd, SCAN_TIMER, delay_ms);
 }
 
 unsafe extern "system" fn window_proc(
@@ -439,19 +943,50 @@ unsafe extern "system" fn window_proc(
             }
             1
         }
-        WM_TIMER if wparam == SCAN_TIMER => {
-            KillTimer(hwnd, SCAN_TIMER);
-            if let Some(Some(retry)) = with_app(|app| app.scan()) {
-                schedule_scan(hwnd, retry);
+        WM_TIMER => {
+            KillTimer(hwnd, wparam);
+            match wparam {
+                SCAN_TIMER => {
+                    if let Some(Some(retry)) = with_app(|app| app.scan()) {
+                        schedule_scan(hwnd, retry);
+                    }
+                }
+                ACTION_TIMER => {
+                    if let Some(Some(delay)) = with_app(|app| app.run_job_step()) {
+                        set_timer(hwnd, ACTION_TIMER, delay);
+                    }
+                }
+                REFRESH_TIMER => {
+                    with_app(|app| app.refresh_levels());
+                }
+                _ => {}
             }
             0
         }
         WM_TRAY => {
-            let event = (lparam as u32) & 0xFFFF;
-            if event == WM_LBUTTONUP || event == WM_RBUTTONUP {
-                show_menu(hwnd);
+            match (lparam as u32) & 0xFFFF {
+                WM_LBUTTONUP => match with_app(|app| app.toggle_flyout()) {
+                    Some(Some(true)) => set_timer(hwnd, REFRESH_TIMER, OPEN_REFRESH_MS),
+                    Some(Some(false)) => {}
+                    _ => show_menu(hwnd),
+                },
+                WM_RBUTTONUP => show_menu(hwnd),
+                _ => {}
             }
             0
+        }
+        WM_SHOW_MENU => {
+            show_menu(hwnd);
+            0
+        }
+        WM_SHOW_SPLIT_MENU => {
+            show_split_menu(hwnd);
+            0
+        }
+        WM_SETTINGCHANGE => {
+            // The light/dark setting may have changed.
+            refresh_menu_theme();
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_CLOSE => {
             DestroyWindow(hwnd);
@@ -470,10 +1005,19 @@ unsafe extern "system" fn window_proc(
     }
 }
 
-unsafe fn show_menu(hwnd: HWND) {
-    let Some(items) = with_app(|app| app.menu()) else {
-        return;
-    };
+unsafe extern "system" fn flyout_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match with_app(|app| app.flyout_message(msg, wparam, lparam)) {
+        Some(Some(result)) => result,
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+unsafe fn build_menu(items: Vec<MenuItem>) -> HMENU {
     let menu = CreatePopupMenu();
     for item in items {
         match item {
@@ -495,32 +1039,97 @@ unsafe fn show_menu(hwnd: HWND) {
                 }
                 AppendMenuW(menu, flags, id, wide(&label).as_ptr());
             }
+            MenuItem::Submenu { label, items } => {
+                let submenu = build_menu(items);
+                AppendMenuW(menu, MF_POPUP, submenu as usize, wide(&label).as_ptr());
+            }
         }
     }
+    menu
+}
+
+/// Shows a menu at the cursor and returns the chosen command, if any.
+unsafe fn track_menu(owner: HWND, items: Vec<MenuItem>) -> Option<usize> {
+    let menu = build_menu(items);
     let mut cursor = POINT { x: 0, y: 0 };
     GetCursorPos(&mut cursor);
     // Required so the menu closes when clicking elsewhere.
-    SetForegroundWindow(hwnd);
+    SetForegroundWindow(owner);
     let command = TrackPopupMenu(
         menu,
         TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
         cursor.x,
         cursor.y,
         0,
-        hwnd,
+        owner,
         null(),
     );
-    PostMessageW(hwnd, WM_NULL, 0, 0);
+    PostMessageW(owner, WM_NULL, 0, 0);
+    // Also destroys the submenus.
     DestroyMenu(menu);
-    if command > 0 {
-        run_command(hwnd, command as usize);
+    usize::try_from(command).ok().filter(|&id| id > 0)
+}
+
+unsafe fn show_menu(hwnd: HWND) {
+    let Some(items) = with_app(|app| app.menu()) else {
+        return;
+    };
+    if let Some(command) = track_menu(hwnd, items) {
+        run_command(hwnd, command);
+    }
+}
+
+/// The split-screen menu from the flyout. It's owned by the flyout so the
+/// flyout stays open while it's shown.
+unsafe fn show_split_menu(hwnd: HWND) {
+    let Some((owner, items)) = with_app(|app| {
+        let owner = app
+            .flyout
+            .as_ref()
+            .filter(|f| f.is_visible())
+            .map_or(app.hwnd, Flyout::hwnd);
+        (owner, app.split_menu())
+    }) else {
+        return;
+    };
+    if let Some(command) = track_menu(owner, items) {
+        run_command(hwnd, command);
     }
 }
 
 fn run_command(hwnd: HWND, command: usize) {
+    let in_range = |base: usize, len: usize| (base..base + len).contains(&command);
+    if in_range(CMD_LEFT, lg::INPUTS.len()) || in_range(CMD_RIGHT, lg::INPUTS.len()) {
+        let left = command < CMD_RIGHT;
+        let input = lg::INPUTS[command - if left { CMD_LEFT } else { CMD_RIGHT }].1;
+        with_app(|app| {
+            app.choose_split(if left {
+                SplitChoice::Left(input)
+            } else {
+                SplitChoice::Right(input)
+            });
+            app.refresh();
+        });
+        return;
+    }
     match command {
         CMD_LOCAL | CMD_REMOTE => {
-            with_app(|app| app.show(command == CMD_LOCAL));
+            with_app(|app| {
+                app.show(command == CMD_LOCAL);
+                app.refresh();
+            });
+        }
+        CMD_PBP => {
+            with_app(|app| {
+                app.toggle_pbp();
+                app.refresh();
+            });
+        }
+        CMD_SWAP => {
+            with_app(|app| {
+                app.swap_sides();
+                app.refresh();
+            });
         }
         CMD_AUTO => {
             with_app(|app| app.toggle_auto());
@@ -540,6 +1149,7 @@ fn run_command(hwnd: HWND, command: usize) {
         CMD_RELOAD => {
             with_app(|app| app.load_config());
             schedule_scan(hwnd, 10);
+            set_timer(hwnd, REFRESH_TIMER, OPEN_REFRESH_MS);
         }
         CMD_LOG => open_in_notepad(&log_path()),
         CMD_EXIT => {
