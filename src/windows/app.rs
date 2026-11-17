@@ -633,6 +633,11 @@ impl App {
         c.record(&result, &job.action);
         self.levels.pbp = c.pbp();
         self.job = None;
+        if result.is_err() {
+            // The controller retries the KVM position if the job left it
+            // unhandled, e.g. split screen went off but the input didn't change.
+            schedule_scan(self.hwnd, RETRY_MS);
+        }
         self.refresh();
         None
     }
