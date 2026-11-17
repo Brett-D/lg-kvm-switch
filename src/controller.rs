@@ -31,8 +31,10 @@ pub enum Outcome {
     Paused,
     /// Picture-by-Picture shows both computers, so inputs are left alone.
     PictureByPicture,
-    /// First reading after startup: the monitor is left alone, since it
-    /// cannot report its input and re-selecting the shown input flickers.
+    /// The monitor already shows the input for the KVM's position.
+    AlreadyShown(u16),
+    /// First reading after startup, with the monitor already on (or, if it
+    /// can't report its input, assumed to be on) the right input.
     Started,
     Switched(u16),
     Failed(String),
@@ -46,6 +48,8 @@ pub struct Levels {
     pub volume: Option<u16>,
     pub muted: Option<bool>,
     pub pbp: Option<bool>,
+    /// Raw split-screen layout code from [`lg::LG_PBP_VCP`].
+    pub layout: Option<u16>,
 }
 
 pub struct Controller {
@@ -123,19 +127,31 @@ impl Controller {
             return Outcome::Paused;
         }
         let target = self.target(here);
-        if !self.started {
+        let current = self.sync_main_input();
+        if !self.started && current.is_none_or(|input| input == target) {
             self.started = true;
             self.acted_on = Some(here);
             self.main_input = Some(target);
             log!(
-                "Startup: assuming the monitor already shows {}",
+                "Startup: the monitor {} {}",
+                if current.is_some() {
+                    "shows"
+                } else {
+                    "is assumed to show"
+                },
                 input_name(target)
             );
             return Outcome::Started;
         }
+        self.started = true;
         if self.pbp() == Some(true) {
-            log!("Picture-by-Picture is on; leaving inputs alone");
+            log!("Split screen is on; leaving inputs alone");
             return Outcome::PictureByPicture;
+        }
+        if current == Some(target) {
+            self.acted_on = Some(here);
+            log!("The monitor already shows {}", input_name(target));
+            return Outcome::AlreadyShown(target);
         }
         match self.monitor.set_input(target) {
             Ok(()) => {
@@ -154,11 +170,16 @@ impl Controller {
         }
     }
 
-    /// Steps that show `input` full screen, turning Picture-by-Picture off
-    /// first if it is on.
+    /// Steps that show `input` full screen, turning split screen off first if
+    /// it is on. Empty if the monitor already shows it.
     pub fn show_steps(&mut self, input: u16) -> Vec<Step> {
+        let current = self.sync_main_input();
         if self.pbp() != Some(true) {
-            return vec![Step::Input(input)];
+            return if current == Some(input) {
+                Vec::new()
+            } else {
+                vec![Step::Input(input)]
+            };
         }
         let mut steps = vec![Step::Layout(lg::PBP_OFF)];
         if self.main_input != Some(input) {
@@ -179,21 +200,26 @@ impl Controller {
         result
     }
 
-    /// The input last selected; in Picture-by-Picture, the one on the left.
+    /// The input shown; in split screen, the left (or main) picture.
     pub fn main_input(&self) -> Option<u16> {
         self.main_input
     }
 
-    /// The other of the local and remote inputs.
-    fn other_input(&self, input: u16) -> u16 {
-        if input == self.settings.local_input {
-            self.settings.remote_input
-        } else {
-            self.settings.local_input
+    /// Reads which input the monitor shows, when it can say, and remembers
+    /// it.
+    pub fn sync_main_input(&mut self) -> Option<u16> {
+        let current = self
+            .monitor
+            .get_vcp(lg::LG_ACTIVE_INPUT_VCP)
+            .ok()
+            .and_then(lg::active_input);
+        if current.is_some() {
+            self.main_input = current;
         }
+        current
     }
 
-    /// Whether Picture-by-Picture is on, if the monitor answers.
+    /// Whether split screen is on, if the monitor answers.
     pub fn pbp(&mut self) -> Option<bool> {
         self.monitor
             .get_vcp(lg::LG_PBP_VCP)
@@ -201,19 +227,30 @@ impl Controller {
             .map(|layout| layout != lg::PBP_OFF)
     }
 
-    /// Steps that turn side-by-side Picture-by-Picture on, with `pbp_left`
-    /// on the left, or off, showing the KVM's position full screen.
-    pub fn pbp_steps(&self, on: bool) -> Vec<Step> {
+    /// Steps that put `left` and `right` on the two pictures of an active
+    /// split. Selecting an input moves it to the left (main) picture and the
+    /// previous one to the right, so select the right-hand input first.
+    fn side_steps(&self, left: u16, right: u16) -> Vec<Step> {
+        let mut steps = Vec::new();
+        if self.main_input != Some(right) {
+            steps.push(Step::Input(right));
+        }
+        steps.push(Step::Input(left));
+        steps
+    }
+
+    /// Steps that turn side-by-side split screen on with the configured
+    /// sides, or off, showing the KVM's position full screen.
+    pub fn pbp_steps(&mut self, on: bool) -> Vec<Step> {
+        self.sync_main_input();
         let mut steps = Vec::new();
         if on {
-            let (left, right) = (self.settings.pbp_left, self.settings.pbp_right());
-            // In PBP, selecting an input moves it to the left half and the
-            // previous one to the right, so start from the right-hand input.
-            if self.main_input != Some(right) {
-                steps.push(Step::Input(right));
+            let s = &self.settings;
+            if self.main_input != Some(s.pbp_right) {
+                steps.push(Step::Input(s.pbp_right));
             }
             steps.push(Step::Layout(lg::PBP_SIDE_BY_SIDE));
-            steps.push(Step::Input(left));
+            steps.push(Step::Input(s.pbp_left));
         } else {
             steps.push(Step::Layout(lg::PBP_OFF));
             if let Some(here) = self.kvm_here {
@@ -226,14 +263,32 @@ impl Controller {
         steps
     }
 
-    /// Swaps the two sides of Picture-by-Picture by selecting the input on
-    /// the right, and makes that the left input from now on. Returns the
-    /// step to run and the new left input.
+    /// Swaps the two pictures by selecting the right-hand input, and keeps
+    /// the new order for next time. Returns the step and the new left input.
     pub fn swap_pbp(&mut self) -> (Step, u16) {
-        let left = self.main_input.unwrap_or(self.settings.pbp_left);
-        let new_left = self.other_input(left);
-        self.settings.pbp_left = new_left;
-        (Step::Input(new_left), new_left)
+        self.sync_main_input();
+        let s = &mut self.settings;
+        let left = self.main_input.unwrap_or(s.pbp_left);
+        let right = if left == s.pbp_left {
+            s.pbp_right
+        } else {
+            s.pbp_left
+        };
+        (s.pbp_left, s.pbp_right) = (right, left);
+        (Step::Input(right), right)
+    }
+
+    /// Changes the split-screen sides. Returns the steps that apply the
+    /// change if split screen is on.
+    pub fn set_split(&mut self, left: u16, right: u16) -> Vec<Step> {
+        let old = (self.settings.pbp_left, self.settings.pbp_right);
+        self.settings.pbp_left = left;
+        self.settings.pbp_right = right;
+        if (left, right) == old || self.pbp() != Some(true) {
+            return Vec::new();
+        }
+        self.sync_main_input();
+        self.side_steps(left, right)
     }
 
     /// Runs one step and updates what the controller knows about the monitor.
@@ -276,28 +331,33 @@ impl Controller {
         result
     }
 
-    /// Describes a Picture-by-Picture change, for logs.
+    /// Describes a split-screen change, for logs.
     pub fn pbp_description(&self, on: bool) -> String {
+        let s = &self.settings;
         if on {
             format!(
-                "turn on Picture-by-Picture ({} left, {} right)",
-                input_name(self.settings.pbp_left),
-                input_name(self.settings.pbp_right())
+                "turn on side by side ({} left, {} right)",
+                input_name(s.pbp_left),
+                input_name(s.pbp_right)
             )
         } else {
-            "turn off Picture-by-Picture".to_string()
+            "turn off split screen".to_string()
         }
     }
 
-    /// Reads brightness, contrast, volume, mute, and Picture-by-Picture.
+    /// Reads brightness, contrast, volume, mute, split screen, and the
+    /// shown input.
     pub fn levels(&mut self) -> Levels {
+        self.sync_main_input();
         let mut read = |vcp| self.monitor.get_vcp(vcp).ok();
+        let layout = read(lg::LG_PBP_VCP);
         Levels {
             brightness: read(lg::VCP_BRIGHTNESS),
             contrast: read(lg::VCP_CONTRAST),
             volume: read(lg::VCP_VOLUME),
             muted: read(lg::VCP_MUTE).map(|v| v == lg::MUTE_ON),
-            pbp: read(lg::LG_PBP_VCP).map(|v| v != lg::PBP_OFF),
+            pbp: layout.map(|v| v != lg::PBP_OFF),
+            layout,
         }
     }
 
@@ -371,6 +431,11 @@ mod tests {
                 return Err("bus error".into());
             }
             self.ops.borrow_mut().push(Op::Input(input));
+            // A monitor that reports its input (VCP 0xF5) now reports this one.
+            let mut values = self.values.borrow_mut();
+            if let Some(active) = values.get_mut(&lg::LG_ACTIVE_INPUT_VCP) {
+                *active = if input == 0xD0 { 1 } else { 2 };
+            }
             Ok(())
         }
 
@@ -520,6 +585,50 @@ mod tests {
             *r.ops.borrow(),
             vec![Op::Vcp(lg::LG_PBP_VCP, lg::PBP_OFF), Op::Input(0xD0)]
         );
+    }
+
+    #[test]
+    fn reads_the_shown_input_to_fix_it_at_startup_and_skip_repeats() {
+        let mut r = rig();
+        // The monitor shows USB-C although the KVM is here: fix it at startup.
+        r.values.borrow_mut().insert(lg::LG_ACTIVE_INPUT_VCP, 2);
+        assert_eq!(r.controller.update(true), Outcome::Switched(0xD0));
+        assert_eq!(r.controller.update(false), Outcome::Switched(0xD1));
+        // Someone picks DisplayPort on the monitor before the KVM comes back.
+        r.values.borrow_mut().insert(lg::LG_ACTIVE_INPUT_VCP, 1);
+        assert_eq!(r.controller.update(true), Outcome::AlreadyShown(0xD0));
+        assert_eq!(r.inputs(), vec![0xD0, 0xD1]);
+        assert!(r.controller.show_steps(0xD0).is_empty());
+    }
+
+    #[test]
+    fn changes_split_sides_while_on() {
+        let mut r = rig();
+        r.controller.update(true);
+        r.controller.set_pbp(true).unwrap();
+        r.ops.borrow_mut().clear();
+        // USB-C is on the left; put DisplayPort there.
+        let steps = r.controller.set_split(0xD0, 0xD1);
+        assert_eq!(steps, vec![Step::Input(0xD0)]);
+        assert!(r.controller.set_split(0xD0, 0xD1).is_empty());
+
+        r.controller.set_pbp(false).unwrap();
+        assert!(r.controller.set_split(0xD1, 0xD0).is_empty());
+        // Off shows DisplayPort (the KVM is here), which is already the right side.
+        assert_eq!(
+            r.controller.pbp_steps(true),
+            vec![Step::Layout(lg::PBP_SIDE_BY_SIDE), Step::Input(0xD1)]
+        );
+    }
+
+    #[test]
+    fn treats_pip_from_the_monitor_menu_as_split_screen() {
+        let mut r = rig();
+        r.controller.update(true);
+        r.values.borrow_mut().insert(lg::LG_PBP_VCP, lg::PBP_PIP);
+        assert_eq!(r.controller.update(false), Outcome::PictureByPicture);
+        assert_eq!(r.controller.levels().layout, Some(lg::PBP_PIP));
+        assert!(r.inputs().is_empty());
     }
 
     #[test]

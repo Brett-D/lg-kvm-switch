@@ -15,8 +15,11 @@ pub struct Config {
     pub watch_devices: Vec<String>,
     pub local_input: String,
     pub remote_input: String,
-    /// Input on the left half in Picture-by-Picture; defaults to `remote_input`.
+    /// Input on the left half in split screen; defaults to `remote_input`.
     pub pbp_left: Option<String>,
+    /// Input on the right half in split screen; defaults to the other of
+    /// `local_input` and `remote_input`.
+    pub pbp_right: Option<String>,
     pub debounce_ms: u64,
     pub monitor_vendor: String,
     pub monitor_product: Option<String>,
@@ -31,6 +34,7 @@ impl Default for Config {
             local_input: "dp".into(),
             remote_input: "usbc".into(),
             pbp_left: None,
+            pbp_right: None,
             debounce_ms: 750,
             monitor_vendor: "GSM".into(),
             monitor_product: None,
@@ -46,25 +50,14 @@ pub struct Settings {
     pub watch: Vec<UsbId>,
     pub local_input: u16,
     pub remote_input: u16,
-    /// Input on the left half in Picture-by-Picture: `local_input` or
-    /// `remote_input`. The other one goes on the right.
+    /// Inputs on the left and right halves in split screen.
     pub pbp_left: u16,
+    pub pbp_right: u16,
     pub debounce: Duration,
     pub monitor_vendor: Option<String>,
     pub monitor_product: Option<u16>,
     pub i2c_bus: Option<PathBuf>,
     pub poll: Duration,
-}
-
-impl Settings {
-    /// Input on the right half in Picture-by-Picture.
-    pub fn pbp_right(&self) -> u16 {
-        if self.pbp_left == self.local_input {
-            self.remote_input
-        } else {
-            self.local_input
-        }
-    }
 }
 
 impl Config {
@@ -86,8 +79,13 @@ impl Config {
             Some(text) => lg::parse_input(text).map_err(|e| format!("pbp_left: {e}"))?,
             None => remote_input,
         };
-        if pbp_left != local_input && pbp_left != remote_input {
-            return Err("pbp_left must be the same input as local_input or remote_input".into());
+        let pbp_right = match &self.pbp_right {
+            Some(text) => lg::parse_input(text).map_err(|e| format!("pbp_right: {e}"))?,
+            None if pbp_left == local_input => remote_input,
+            None => local_input,
+        };
+        if pbp_left == pbp_right {
+            return Err("pbp_left and pbp_right must be different inputs".into());
         }
         let monitor_product = self
             .monitor_product
@@ -104,6 +102,7 @@ impl Config {
             local_input,
             remote_input,
             pbp_left,
+            pbp_right,
             debounce: Duration::from_millis(self.debounce_ms),
             monitor_vendor: (!vendor.is_empty()).then(|| vendor.to_ascii_uppercase()),
             monitor_product,
@@ -132,6 +131,10 @@ impl Config {
             Some(input) => format!("pbp_left = {}", quote(input)),
             None => format!("# pbp_left = {}", quote(&self.remote_input)),
         };
+        let pbp_right = match &self.pbp_right {
+            Some(input) => format!("pbp_right = {}", quote(input)),
+            None => format!("# pbp_right = {}", quote(&self.local_input)),
+        };
         format!(
             r#"# lg-kvm-switch configuration
 
@@ -145,9 +148,11 @@ watch_devices = [{watch}]
 local_input = {local}
 remote_input = {remote}
 
-# Picture-by-Picture: the input on the left half (local_input or
-# remote_input); the other goes on the right. Defaults to remote_input.
+# Split screen (side by side): the inputs on the left and right halves.
+# Default to remote_input on the left and local_input on the right.
+# Picture-in-picture can only be turned on from the monitor's own menu.
 {pbp_left}
+{pbp_right}
 
 # Wait for USB changes to settle this long before switching.
 debounce_ms = {debounce}
@@ -233,6 +238,7 @@ mod tests {
         let config = Config {
             watch_devices: vec!["FC32:1287".into(), "046D:C07D".into()],
             pbp_left: Some("dp".into()),
+            pbp_right: Some("hdmi1".into()),
             monitor_product: Some("9E9D".into()),
             i2c_bus: Some(r"/dev/i2c-5".into()),
             ..Config::default()
@@ -271,20 +277,27 @@ mod tests {
     }
 
     #[test]
-    fn pbp_layout_defaults_to_remote_on_the_left() {
+    fn split_sides_default_to_remote_left_and_local_right() {
         let settings = Config::default().settings().unwrap();
-        assert_eq!((settings.pbp_left, settings.pbp_right()), (0xD1, 0xD0));
-        let swapped = Config {
+        assert_eq!((settings.pbp_left, settings.pbp_right), (0xD1, 0xD0));
+        let local_left = Config {
             pbp_left: Some("dp".into()),
             ..Config::default()
         };
-        let settings = swapped.settings().unwrap();
-        assert_eq!((settings.pbp_left, settings.pbp_right()), (0xD0, 0xD1));
-        let unrelated = Config {
+        let settings = local_left.settings().unwrap();
+        assert_eq!((settings.pbp_left, settings.pbp_right), (0xD0, 0xD1));
+        let hdmi = Config {
             pbp_left: Some("hdmi1".into()),
             ..Config::default()
         };
-        assert!(unrelated.settings().is_err());
+        let settings = hdmi.settings().unwrap();
+        assert_eq!((settings.pbp_left, settings.pbp_right), (0x90, 0xD0));
+        let same = Config {
+            pbp_left: Some("dp".into()),
+            pbp_right: Some("dp".into()),
+            ..Config::default()
+        };
+        assert!(same.settings().is_err());
     }
 
     #[test]

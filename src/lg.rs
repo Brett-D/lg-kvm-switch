@@ -27,6 +27,32 @@ pub const LG_PBP_VCP: u8 = 0xD7;
 pub const PBP_OFF: u16 = 0x01;
 /// Left/right 50/50 split.
 pub const PBP_SIDE_BY_SIDE: u16 = 0x05;
+/// Reported while picture-in-picture is on. PIP can only be turned on from
+/// the monitor's own menu: the monitor rejects this value over DDC/CI.
+pub const PBP_PIP: u16 = 0x00;
+
+/// LG's active-input index: the input shown, or the main picture in a split.
+/// Unlike VCP 0x60, which always reports DisplayPort, it is accurate.
+pub const LG_ACTIVE_INPUT_VCP: u8 = 0xF5;
+
+/// Maps an active-input index to an LG input code. Only DisplayPort and USB-C
+/// are verified (on the 45GX950A-B); other indexes are unknown.
+pub fn active_input(index: u16) -> Option<u16> {
+    match index {
+        1 => Some(0xD0),
+        2 => Some(0xD1),
+        _ => None,
+    }
+}
+
+/// Names a split-screen layout read from [`LG_PBP_VCP`].
+pub fn layout_name(code: u16) -> &'static str {
+    match code {
+        PBP_SIDE_BY_SIDE => "Side by side",
+        PBP_PIP => "Picture in picture",
+        _ => "Split screen",
+    }
+}
 
 /// Named inputs: (config name, LG input code, label).
 pub const INPUTS: &[(&str, u16, &str)] = &[

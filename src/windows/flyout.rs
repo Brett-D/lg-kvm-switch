@@ -35,8 +35,8 @@ use windows_sys::Win32::Graphics::Dwm::{
     DWMWA_WINDOW_CORNER_PREFERENCE,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, InvalidateRect, MonitorFromPoint, ScreenToClient, ValidateRect, MONITORINFO,
-    MONITOR_DEFAULTTONEAREST,
+    GetMonitorInfoW, InvalidateRect, MonitorFromPoint, MonitorFromWindow, ScreenToClient,
+    ValidateRect, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Registry::{
@@ -50,10 +50,11 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, GetClientRect, GetCursorPos, GetForegroundWindow, GetWindowRect, KillTimer,
     LoadCursorW, RegisterClassW, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow,
-    CS_DROPSHADOW, HWND_TOPMOST, IDC_ARROW, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
-    SWP_SHOWWINDOW, SW_HIDE, WA_INACTIVE, WM_ACTIVATE, WM_CAPTURECHANGED, WM_DPICHANGED,
-    WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT,
-    WM_TIMER, WNDCLASSW, WNDPROC, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CS_DROPSHADOW, HWND_TOPMOST, IDC_ARROW, SPI_SETWORKAREA, SWP_NOACTIVATE, SWP_NOSIZE,
+    SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, WA_INACTIVE, WM_ACTIVATE, WM_CAPTURECHANGED,
+    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW,
+    WNDPROC, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -83,6 +84,8 @@ const SEND_INTERVAL: Duration = Duration::from_millis(120);
 /// A tray click that arrives this soon after the flyout closed is the click
 /// that closed it, so it shouldn't reopen it.
 const REOPEN_GUARD: Duration = Duration::from_millis(400);
+/// Width of the dropdown part of a tile that has options.
+const MENU_ZONE: f32 = 20.0;
 
 const FLUSH_TIMER: usize = 1;
 const SLIDE_TIMER: usize = 2;
@@ -99,6 +102,7 @@ pub const GLYPH_CONTRAST: char = '\u{E793}';
 pub const GLYPH_VOLUME: char = '\u{E767}';
 pub const GLYPH_MUTED: char = '\u{E74F}';
 const GLYPH_SETTINGS: char = '\u{E713}';
+const GLYPH_CHEVRON: char = '\u{E70D}';
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Tile {
@@ -106,6 +110,8 @@ pub struct Tile {
     pub label: String,
     pub on: bool,
     pub enabled: bool,
+    /// Right-clicking opens a menu of options; shown with a small chevron.
+    pub has_menu: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -130,6 +136,8 @@ pub struct Model {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     Tile(usize),
+    /// Right-click on a tile that has options.
+    TileMenu(usize),
     SetLevel(usize, u16),
     Icon(usize),
     /// The settings button.
@@ -140,6 +148,8 @@ pub enum Action {
 enum Hit {
     None,
     Tile(usize),
+    /// The dropdown part on the right of a tile that has options.
+    TileMenu(usize),
     Track(usize),
     Icon(usize),
     Settings,
@@ -349,6 +359,7 @@ struct Fonts {
     status: IDWriteTextFormat,
     caption: IDWriteTextFormat,
     icon: IDWriteTextFormat,
+    small_icon: IDWriteTextFormat,
 }
 
 impl Fonts {
@@ -411,6 +422,12 @@ impl Fonts {
             icon: make(
                 icons,
                 16.0,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_TEXT_ALIGNMENT_CENTER,
+            )?,
+            small_icon: make(
+                icons,
+                8.0,
                 DWRITE_FONT_WEIGHT_NORMAL,
                 DWRITE_TEXT_ALIGNMENT_CENTER,
             )?,
@@ -609,10 +626,31 @@ impl Flyout {
                 (&border as *const u32).cast::<c_void>(),
                 4,
             );
+        }
+        self.place(true);
+        // SAFETY: plain Win32 calls on our own window.
+        unsafe {
+            SetForegroundWindow(self.hwnd);
+            SetFocus(self.hwnd);
+            SetTimer(self.hwnd, OUTSIDE_TIMER, 100, None);
+        }
+        self.visible = true;
+        self.invalidate();
+    }
 
-            let mut cursor = POINT { x: 0, y: 0 };
-            GetCursorPos(&mut cursor);
-            let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+    /// Sizes and positions the flyout next to the taskbar, like Windows' own
+    /// flyouts: on the monitor under the cursor when opening, and on its
+    /// current monitor when the display changes while it's open.
+    fn place(&mut self, opening: bool) {
+        // SAFETY: plain Win32 calls on our own window.
+        unsafe {
+            let monitor = if opening {
+                let mut cursor = POINT { x: 0, y: 0 };
+                GetCursorPos(&mut cursor);
+                MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST)
+            } else {
+                MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST)
+            };
             let mut info: MONITORINFO = zeroed();
             info.cbSize = size_of::<MONITORINFO>() as u32;
             GetMonitorInfoW(monitor, &mut info);
@@ -624,7 +662,6 @@ impl Flyout {
             let (work, screen) = (info.rcWork, info.rcMonitor);
             let (w, h, margin) = (px(WIDTH), px(HEIGHT), px(12.0));
 
-            // Open next to the taskbar, like Windows' own flyouts.
             let taskbar_top = work.top > screen.top;
             let taskbar_left = work.left > screen.left;
             let x = if taskbar_left {
@@ -632,27 +669,33 @@ impl Flyout {
             } else {
                 work.right - w - margin
             };
-            let (y, from) = if taskbar_top {
-                let y = work.top + margin;
-                (y, y - px(SLIDE))
+            let y = if taskbar_top {
+                work.top + margin
             } else {
-                let y = work.bottom - h - margin;
-                (y, y + px(SLIDE))
+                work.bottom - h - margin
             };
-            SetWindowPos(self.hwnd, HWND_TOPMOST, x, from, w, h, SWP_SHOWWINDOW);
-            SetForegroundWindow(self.hwnd);
-            SetFocus(self.hwnd);
-            self.slide = Some(Slide {
-                start: Instant::now(),
-                x,
-                from,
-                to: y,
-            });
-            SetTimer(self.hwnd, SLIDE_TIMER, 10, None);
-            SetTimer(self.hwnd, OUTSIDE_TIMER, 100, None);
+            if opening {
+                // Slide in from the taskbar side.
+                let from = if taskbar_top {
+                    y - px(SLIDE)
+                } else {
+                    y + px(SLIDE)
+                };
+                SetWindowPos(self.hwnd, HWND_TOPMOST, x, from, w, h, SWP_SHOWWINDOW);
+                self.slide = Some(Slide {
+                    start: Instant::now(),
+                    x,
+                    from,
+                    to: y,
+                });
+                SetTimer(self.hwnd, SLIDE_TIMER, 10, None);
+            } else {
+                self.slide = None;
+                KillTimer(self.hwnd, SLIDE_TIMER);
+                SetWindowPos(self.hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
+                self.invalidate();
+            }
         }
-        self.visible = true;
-        self.invalidate();
     }
 
     /// Closes the flyout, returning any slider change not yet sent.
@@ -729,6 +772,9 @@ impl Flyout {
 
     fn hit(&self, x: f32, y: f32) -> Hit {
         if let Some(i) = (0..self.model.tiles.len()).find(|&i| contains(&tile_rect(i), x, y)) {
+            if self.model.tiles[i].has_menu && x >= tile_rect(i).right - MENU_ZONE {
+                return Hit::TileMenu(i);
+            }
             return Hit::Tile(i);
         }
         for i in 0..self.model.sliders.len() {
@@ -900,11 +946,36 @@ impl Flyout {
                 }
                 let action = match pressed {
                     Hit::Tile(i) if self.model.tiles[i].enabled => Some(Action::Tile(i)),
+                    Hit::TileMenu(i) => Some(Action::TileMenu(i)),
                     Hit::Icon(i) if self.model.sliders[i].icon_button => Some(Action::Icon(i)),
                     Hit::Settings => Some(Action::Settings),
                     _ => None,
                 };
                 (Some(0), action)
+            }
+            WM_RBUTTONUP => {
+                let (x, y) = point_from(lparam);
+                let (x, y) = self.to_dips(x, y);
+                let action = match self.hit(x, y) {
+                    Hit::Tile(i) | Hit::TileMenu(i) if self.model.tiles[i].has_menu => {
+                        Some(Action::TileMenu(i))
+                    }
+                    _ => None,
+                };
+                (Some(0), action)
+            }
+            WM_DISPLAYCHANGE => {
+                // Split screen changes this computer's resolution and scaling.
+                if self.visible {
+                    self.place(false);
+                }
+                (Some(0), None)
+            }
+            WM_SETTINGCHANGE if wparam == SPI_SETWORKAREA as usize => {
+                if self.visible {
+                    self.place(false);
+                }
+                (Some(0), None)
             }
             WM_CAPTURECHANGED => {
                 self.dragging = None;
@@ -1009,10 +1080,15 @@ impl Flyout {
                 p.outline(r, 4.0, color(t.tile_border, alpha));
             }
             let glyph_color = if tile.on { t.on_accent } else { t.text };
+            let main = if tile.has_menu {
+                rect(r.left, r.top, TILE_W - MENU_ZONE, TILE_H)
+            } else {
+                r
+            };
             p.text(
                 &tile.glyph.to_string(),
                 &fonts.icon,
-                r,
+                main,
                 color(glyph_color, alpha),
             );
             p.text(
@@ -1021,6 +1097,30 @@ impl Flyout {
                 rect(r.left - 6.0, r.bottom + 4.0, TILE_W + 12.0, 18.0),
                 color(t.text, alpha),
             );
+            if tile.has_menu {
+                // A split button: the right part opens the options menu.
+                let zone = rect(r.right - MENU_ZONE, r.top, MENU_ZONE, TILE_H);
+                if self.hover == Hit::TileMenu(i) {
+                    let inset = rect(zone.left, zone.top + 1.0, MENU_ZONE - 1.0, TILE_H - 2.0);
+                    let fill = if tile.on {
+                        color(t.on_accent, 0.12)
+                    } else {
+                        color(t.tile_hover, 1.0)
+                    };
+                    p.fill(inset, 3.0, fill);
+                }
+                p.fill(
+                    rect(zone.left, r.top + 12.0, 1.0, TILE_H - 24.0),
+                    0.0,
+                    color(glyph_color, 0.25),
+                );
+                p.text(
+                    &GLYPH_CHEVRON.to_string(),
+                    &fonts.small_icon,
+                    zone,
+                    color(glyph_color, 0.8),
+                );
+            }
         }
 
         for (i, slider) in self.model.sliders.iter().enumerate() {

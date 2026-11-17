@@ -139,7 +139,7 @@ fn pbp(path: &Path, arg: Option<&str>) -> Result<(), String> {
             let on = controller
                 .pbp()
                 .ok_or("the monitor did not report its layout")?;
-            println!("Picture-by-Picture: {}", on_off(on));
+            println!("Split screen: {}", on_off(on));
         }
         Some(arg) => {
             let on = parse_on_off(arg)?;
@@ -147,12 +147,12 @@ fn pbp(path: &Path, arg: Option<&str>) -> Result<(), String> {
             let s = controller.settings();
             if on {
                 println!(
-                    "Picture-by-Picture on: {} left, {} right",
+                    "Side by side on: {} left, {} right",
                     input_name(s.pbp_left),
-                    input_name(s.pbp_right())
+                    input_name(s.pbp_right)
                 );
             } else {
-                println!("Picture-by-Picture off");
+                println!("Split screen off");
             }
         }
     }
@@ -361,6 +361,20 @@ fn status(path: &Path) -> Result<(), String> {
                     selected.join("; ")
                 }
             );
+            if !selected.is_empty() {
+                let mut monitor = monitor::open(&settings);
+                let shown = monitor
+                    .get_vcp(lg::LG_ACTIVE_INPUT_VCP)
+                    .ok()
+                    .and_then(lg::active_input)
+                    .map_or_else(|| "unknown".to_string(), input_name);
+                let split = match monitor.get_vcp(lg::LG_PBP_VCP) {
+                    Ok(lg::PBP_OFF) => " (full screen)".to_string(),
+                    Ok(layout) => format!(" ({}, main picture)", lg::layout_name(layout)),
+                    Err(_) => String::new(),
+                };
+                println!("Showing:   {shown}{split}");
+            }
         }
         Err(e) => println!("Monitor:   {e}"),
     }

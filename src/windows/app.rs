@@ -34,15 +34,16 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetCursorPos, GetMessageW, KillTimer, MessageBoxW, PostMessageW,
     PostQuitMessage, RegisterClassW, RegisterDeviceNotificationW, RegisterWindowMessageW,
     SetForegroundWindow, SetTimer, TrackPopupMenu, TranslateMessage, DBT_DEVTYP_DEVICEINTERFACE,
-    DEVICE_NOTIFY_WINDOW_HANDLE, DEV_BROADCAST_DEVICEINTERFACE_W, HICON, MB_ICONERROR, MB_OK,
-    MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, PBT_APMRESUMEAUTOMATIC, SW_SHOWNORMAL,
-    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_DESTROY, WM_DEVICECHANGE,
-    WM_LBUTTONUP, WM_NULL, WM_POWERBROADCAST, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW,
-    WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+    DEVICE_NOTIFY_WINDOW_HANDLE, DEV_BROADCAST_DEVICEINTERFACE_W, HICON, HMENU, MB_ICONERROR,
+    MB_OK, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, PBT_APMRESUMEAUTOMATIC,
+    SW_SHOWNORMAL, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_DESTROY,
+    WM_DEVICECHANGE, WM_LBUTTONUP, WM_NULL, WM_POWERBROADCAST, WM_RBUTTONUP, WM_SETTINGCHANGE,
+    WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
 };
 
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_SHOW_MENU: u32 = WM_APP + 2;
+const WM_SHOW_SPLIT_MENU: u32 = WM_APP + 3;
 const SCAN_TIMER: usize = 1;
 /// Runs the next step of a multi-step monitor change.
 const ACTION_TIMER: usize = 2;
@@ -69,6 +70,9 @@ const CMD_LOG: usize = 16;
 const CMD_EXIT: usize = 17;
 const CMD_PBP: usize = 18;
 const CMD_SWAP: usize = 19;
+/// Split-screen menu commands: base + index into `lg::INPUTS`.
+const CMD_LEFT: usize = 200;
+const CMD_RIGHT: usize = 300;
 
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
@@ -121,6 +125,16 @@ enum MenuItem {
         checked: bool,
         enabled: bool,
     },
+    Submenu {
+        label: String,
+        items: Vec<MenuItem>,
+    },
+}
+
+/// A choice from the split-screen menu.
+enum SplitChoice {
+    Left(u16),
+    Right(u16),
 }
 
 impl App {
@@ -214,14 +228,20 @@ impl App {
                 State::Here
             };
             let left = c.main_input().unwrap_or(s.pbp_left);
-            let right = if left == s.local_input {
-                s.remote_input
+            let right = if left == s.pbp_left {
+                s.pbp_right
             } else {
-                s.local_input
+                s.pbp_left
             };
+            let layout = self.levels.layout.unwrap_or(lg::PBP_SIDE_BY_SIDE);
             return (
                 state,
-                format!("Side by side: {} | {}", input_name(left), input_name(right)),
+                format!(
+                    "{}: {} | {}",
+                    lg::layout_name(layout),
+                    input_name(left),
+                    input_name(right)
+                ),
             );
         }
         match (c.auto, c.kvm_here) {
@@ -308,6 +328,7 @@ impl App {
             label: label.into(),
             on,
             enabled: ready,
+            has_menu: false,
         };
         let muted = self.levels.muted == Some(true);
         let slider = |glyph, label: &str, value, icon_button| Slider {
@@ -315,6 +336,12 @@ impl App {
             label: label.into(),
             value,
             icon_button,
+        };
+        // PIP can only be turned on from the monitor's menu; show it if it is.
+        let split_label = if pbp && self.levels.layout == Some(lg::PBP_PIP) {
+            "Pic in pic"
+        } else {
+            "Side by side"
         };
         Model {
             tiles: vec![
@@ -328,7 +355,10 @@ impl App {
                     "Other PC",
                     ready && !pbp && main == Some(remote),
                 ),
-                tile(flyout::GLYPH_SIDE_BY_SIDE, "Side by side", pbp),
+                Tile {
+                    has_menu: ready,
+                    ..tile(flyout::GLYPH_SIDE_BY_SIDE, split_label, pbp)
+                },
                 Tile {
                     enabled: ready && pbp,
                     ..tile(flyout::GLYPH_SWAP, "Swap sides", false)
@@ -400,6 +430,11 @@ impl App {
                 schedule_scan(self.hwnd, 10);
             }
             Action::Tile(_) => {}
+            Action::TileMenu(_) => {
+                // SAFETY: posting to our own window; the menu opens outside
+                // this borrow of the app state.
+                unsafe { PostMessageW(self.hwnd, WM_SHOW_SPLIT_MENU, 0, 0) };
+            }
             Action::SetLevel(i, value) => self.set_level(i, value),
             Action::Icon(_) => self.toggle_mute(),
             Action::Settings => {
@@ -450,14 +485,100 @@ impl App {
             vec![step],
             format!("swap sides ({} now on the left)", input_name(left)),
         );
-        // Remember the order for the next time side by side is turned on.
+        self.save_split();
+    }
+
+    /// Applies a choice from the split-screen menu and saves it.
+    fn choose_split(&mut self, choice: SplitChoice) {
+        let Some(c) = self.controller.as_mut() else {
+            return;
+        };
+        let s = c.settings();
+        let (mut left, mut right) = (s.pbp_left, s.pbp_right);
+        // Picking the input already on the other side swaps the two.
+        match choice {
+            SplitChoice::Left(input) => {
+                if input == right {
+                    right = left;
+                }
+                left = input;
+            }
+            SplitChoice::Right(input) => {
+                if input == left {
+                    left = right;
+                }
+                right = input;
+            }
+        }
+        let steps = c.set_split(left, right);
+        let action = format!(
+            "set split screen to {} left, {} right",
+            input_name(left),
+            input_name(right)
+        );
+        if steps.is_empty() {
+            log!(
+                "Split screen will use {}",
+                &action["set split screen to ".len()..]
+            );
+        }
+        self.start_job(steps, action);
+        self.save_split();
+    }
+
+    /// Saves the split-screen sides so they're used next time.
+    fn save_split(&self) {
+        let Some(c) = &self.controller else {
+            return;
+        };
+        let s = c.settings();
         let saved = config::load(&self.config_path).and_then(|mut config| {
-            config.pbp_left = Some(lg::input_key(left));
+            config.pbp_left = Some(lg::input_key(s.pbp_left));
+            config.pbp_right = Some(lg::input_key(s.pbp_right));
             config::save(&self.config_path, &config)
         });
         if let Err(e) = saved {
-            log!("Could not save the side-by-side order: {e}");
+            log!("Could not save the split-screen settings: {e}");
         }
+    }
+
+    /// The split-screen options, for the flyout tile's right-click menu and
+    /// the tray menu.
+    fn split_menu(&self) -> Vec<MenuItem> {
+        let Some(c) = &self.controller else {
+            return Vec::new();
+        };
+        let s = c.settings();
+        let header = |label: &str| MenuItem::Item {
+            id: 0,
+            label: label.into(),
+            checked: false,
+            enabled: false,
+        };
+        let choice = |id, label: &str, checked| MenuItem::Item {
+            id,
+            label: label.into(),
+            checked,
+            enabled: true,
+        };
+        let mut items = vec![header("Left side")];
+        for (i, (_, code, label)) in lg::INPUTS.iter().enumerate() {
+            items.push(choice(CMD_LEFT + i, label, s.pbp_left == *code));
+        }
+        items.push(MenuItem::Separator);
+        items.push(header("Right side"));
+        for (i, (_, code, label)) in lg::INPUTS.iter().enumerate() {
+            items.push(choice(CMD_RIGHT + i, label, s.pbp_right == *code));
+        }
+        items.push(MenuItem::Separator);
+        items.push(MenuItem::Item {
+            id: CMD_SWAP,
+            label: "Swap sides".into(),
+            checked: false,
+            enabled: self.levels.pbp == Some(true),
+        });
+        items.push(header("Picture in picture: monitor menu"));
+        items
     }
 
     fn start_job(&mut self, steps: Vec<Step>, action: String) {
@@ -537,13 +658,12 @@ impl App {
             MenuItem::Separator,
             item(CMD_LOCAL, format!("Show {local}"), false, ready),
             item(CMD_REMOTE, format!("Show {remote}"), false, ready),
-            item(
-                CMD_PBP,
-                "Side by side (Picture-by-Picture)".into(),
-                pbp,
-                ready,
-            ),
+            item(CMD_PBP, "Split screen (side by side)".into(), pbp, ready),
             item(CMD_SWAP, "Swap sides".into(), false, ready && pbp),
+            MenuItem::Submenu {
+                label: "Split screen options".into(),
+                items: self.split_menu(),
+            },
             MenuItem::Separator,
             item(CMD_AUTO, "Switch automatically".into(), auto, ready),
             item(
@@ -826,6 +946,10 @@ unsafe extern "system" fn window_proc(
             show_menu(hwnd);
             0
         }
+        WM_SHOW_SPLIT_MENU => {
+            show_split_menu(hwnd);
+            0
+        }
         WM_SETTINGCHANGE => {
             // The light/dark setting may have changed.
             refresh_menu_theme();
@@ -860,10 +984,7 @@ unsafe extern "system" fn flyout_proc(
     }
 }
 
-unsafe fn show_menu(hwnd: HWND) {
-    let Some(items) = with_app(|app| app.menu()) else {
-        return;
-    };
+unsafe fn build_menu(items: Vec<MenuItem>) -> HMENU {
     let menu = CreatePopupMenu();
     for item in items {
         match item {
@@ -885,29 +1006,79 @@ unsafe fn show_menu(hwnd: HWND) {
                 }
                 AppendMenuW(menu, flags, id, wide(&label).as_ptr());
             }
+            MenuItem::Submenu { label, items } => {
+                let submenu = build_menu(items);
+                AppendMenuW(menu, MF_POPUP, submenu as usize, wide(&label).as_ptr());
+            }
         }
     }
+    menu
+}
+
+/// Shows a menu at the cursor and returns the chosen command, if any.
+unsafe fn track_menu(owner: HWND, items: Vec<MenuItem>) -> Option<usize> {
+    let menu = build_menu(items);
     let mut cursor = POINT { x: 0, y: 0 };
     GetCursorPos(&mut cursor);
     // Required so the menu closes when clicking elsewhere.
-    SetForegroundWindow(hwnd);
+    SetForegroundWindow(owner);
     let command = TrackPopupMenu(
         menu,
         TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
         cursor.x,
         cursor.y,
         0,
-        hwnd,
+        owner,
         null(),
     );
-    PostMessageW(hwnd, WM_NULL, 0, 0);
+    PostMessageW(owner, WM_NULL, 0, 0);
+    // Also destroys the submenus.
     DestroyMenu(menu);
-    if command > 0 {
-        run_command(hwnd, command as usize);
+    usize::try_from(command).ok().filter(|&id| id > 0)
+}
+
+unsafe fn show_menu(hwnd: HWND) {
+    let Some(items) = with_app(|app| app.menu()) else {
+        return;
+    };
+    if let Some(command) = track_menu(hwnd, items) {
+        run_command(hwnd, command);
+    }
+}
+
+/// The split-screen menu from the flyout. It's owned by the flyout so the
+/// flyout stays open while it's shown.
+unsafe fn show_split_menu(hwnd: HWND) {
+    let Some((owner, items)) = with_app(|app| {
+        let owner = app
+            .flyout
+            .as_ref()
+            .filter(|f| f.is_visible())
+            .map_or(app.hwnd, Flyout::hwnd);
+        (owner, app.split_menu())
+    }) else {
+        return;
+    };
+    if let Some(command) = track_menu(owner, items) {
+        run_command(hwnd, command);
     }
 }
 
 fn run_command(hwnd: HWND, command: usize) {
+    let in_range = |base: usize, len: usize| (base..base + len).contains(&command);
+    if in_range(CMD_LEFT, lg::INPUTS.len()) || in_range(CMD_RIGHT, lg::INPUTS.len()) {
+        let left = command < CMD_RIGHT;
+        let input = lg::INPUTS[command - if left { CMD_LEFT } else { CMD_RIGHT }].1;
+        with_app(|app| {
+            app.choose_split(if left {
+                SplitChoice::Left(input)
+            } else {
+                SplitChoice::Right(input)
+            });
+            app.refresh();
+        });
+        return;
+    }
     match command {
         CMD_LOCAL | CMD_REMOTE => {
             with_app(|app| {

@@ -48,13 +48,23 @@ Other controls use the standard host address `0x51`:
 
 | Control | VCP code | Values |
 | --- | --- | --- |
-| Picture-by-Picture (LG) | `0xD7` | `0x01` off, `0x05` side by side 50/50 |
+| Picture-by-Picture (LG) | `0xD7` | `0x01` off, `0x05` side by side 50/50, `0x00` picture-in-picture (read only) |
+| Shown input (LG) | `0xF5` | `1` DisplayPort, `2` USB-C (the left picture in a split) |
 | Brightness, contrast, volume | `0x10`, `0x12`, `0x62` | 0–100 |
 | Mute | `0x8D` | `0x01` muted, `0x02` unmuted |
 
 With Picture-by-Picture on, selecting an input moves it to the left half and
 the previous input to the right. The monitor ignores commands for a few
 seconds after a layout change, so multi-step changes are spaced 3 s apart.
+
+The standard input code (VCP `0x60`) always reports DisplayPort, so the shown
+input is read from LG's `0xF5` instead. Only the DisplayPort and USB-C values
+are verified.
+
+Picture-in-picture can only be turned on from the monitor's own menu: the
+monitor rejects `0xD7 = 0x00` over DDC/CI. (OnScreen Control's PIP option
+doesn't use the monitor's PIP either; it arranges windows on your desktop.)
+lg-kvm-switch still detects PIP and treats it like split screen.
 
 ## Install
 
@@ -88,6 +98,7 @@ attached to each CI run.
    local_input = "dp"     # this computer
    remote_input = "usbc"  # the other computer
    pbp_left = "usbc"      # left half in Picture-by-Picture (optional)
+   pbp_right = "dp"       # right half (optional)
    ```
 
 3. Check that the monitor is reachable, then switch it once to confirm:
@@ -111,16 +122,18 @@ Left-click the icon for the flyout. It follows your light or dark theme and
 accent color:
 
 - **This PC** / **Other PC**: show that computer full screen.
-- **Side by side**: Picture-by-Picture, with `pbp_left` on the left.
-  Automatic switching waits while it's on, since both computers are visible.
+- **Side by side**: Picture-by-Picture, with `pbp_left` on the left and
+  `pbp_right` on the right. Automatic switching waits while it's on, since
+  both computers are visible. Click the tile's arrow (or right-click the tile)
+  to choose the input for each side.
 - **Swap sides**: swap the halves, and remember the order for next time.
 - **Auto switch**: pause or resume following the KVM.
 - **Brightness**, **Contrast**, and **Volume** sliders; click the speaker to
   mute.
 
 Right-click the icon (or click the gear in the flyout) for the same actions
-plus **Start with Windows**, editing or reloading the config, and the log
-(`%LOCALAPPDATA%\lg-kvm-switch\lg-kvm-switch.log`).
+plus **Split screen options**, **Start with Windows**, editing or reloading
+the config, and the log (`%LOCALAPPDATA%\lg-kvm-switch\lg-kvm-switch.log`).
 `lg-kvm-switch autostart on` also enables start-at-logon.
 
 You can uninstall LG OnScreen Control; lg-kvm-switch doesn't use it.
@@ -155,11 +168,13 @@ The monitor's bus is found by reading EDIDs. To pin it, set
 
 - USB changes are debounced (`debounce_ms`, default 750 ms), so the burst of
   events from a KVM switch causes one input change.
-- At startup the monitor is left alone. LG monitors can't reliably report
-  which input they show, and re-selecting the input already shown makes the
-  screen flicker.
-- While Picture-by-Picture is on, KVM moves don't switch inputs. Turning it
-  off shows the computer that has the KVM.
+- At startup the monitor is only switched if it reports showing the wrong
+  input; monitors that can't report it are left alone. Re-selecting the input
+  already shown makes the screen flicker, so the shown input is checked before
+  every switch.
+- While split screen (side by side, or PIP turned on from the monitor's menu)
+  is on, KVM moves don't switch inputs. Turning it off shows the computer that
+  has the KVM.
 - After the PC wakes from sleep, the KVM position is checked again.
 - A failed switch is retried every 5 seconds.
 
@@ -176,7 +191,7 @@ lg-kvm-switch mute [on|off]       Show or set mute
 lg-kvm-switch devices             List USB devices (* = watched)
 lg-kvm-switch learn               Detect the KVM's devices
 lg-kvm-switch monitors            List reachable monitors (* = controlled)
-lg-kvm-switch status              Show config, KVM position, and monitor
+lg-kvm-switch status              Show config, KVM position, and the input shown
 lg-kvm-switch autostart on|off    Start the tray app at Windows logon
 ```
 
