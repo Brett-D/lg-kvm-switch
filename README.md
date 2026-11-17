@@ -131,6 +131,11 @@ accent color:
 - **Brightness**, **Contrast**, and **Volume** sliders; click the speaker to
   mute.
 
+Keyboard: Tab or the arrow keys move between controls, Enter or Space
+activates one, the arrows, Page Up/Down, Home, and End adjust a slider, and
+the Menu key (or Shift+F10) opens the split-screen options. Pressing Enter on
+the tray icon (Win+B) opens the menu.
+
 Right-click the icon (or click the gear in the flyout) for the same actions
 plus **Split screen options**, **Start with Windows**, editing or reloading
 the config, and the log (`%LOCALAPPDATA%\lg-kvm-switch\lg-kvm-switch.log`).

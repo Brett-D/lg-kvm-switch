@@ -28,7 +28,8 @@ pub fn run(config_path: &Path) -> Result<(), String> {
     let mut controller = Controller::new(settings.clone(), Box::new(I2cMonitor::new(&settings)));
 
     // Act once per KVM position, after it has been stable for the debounce
-    // period; repeat only to retry a failed switch.
+    // period; repeat only to retry a failed switch, or one waiting for split
+    // screen to end.
     let mut seen: Option<bool> = None;
     let mut changed_at = Instant::now();
     let mut handled: Option<bool> = None;
@@ -46,7 +47,9 @@ pub fn run(config_path: &Path) -> Result<(), String> {
                 if settled && due {
                     handled = Some(here);
                     retry_at = match controller.update(here) {
-                        Outcome::Failed(_) => Some(Instant::now() + RETRY),
+                        Outcome::Failed(_) | Outcome::PictureByPicture => {
+                            Some(Instant::now() + RETRY)
+                        }
                         _ => None,
                     };
                 }

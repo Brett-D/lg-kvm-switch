@@ -194,8 +194,14 @@ impl App {
                 let here = controller.is_here(&present);
                 match controller.update(here) {
                     Outcome::Failed(_) => true,
+                    // Check again in case split screen is turned off from
+                    // the monitor's menu.
                     Outcome::PictureByPicture => {
                         self.levels.pbp = Some(true);
+                        true
+                    }
+                    Outcome::Switched(_) | Outcome::AlreadyShown(_) => {
+                        self.levels.pbp = Some(false);
                         false
                     }
                     _ => false,
@@ -453,6 +459,9 @@ impl App {
 
     /// Shows this or the other computer full screen.
     fn show(&mut self, local: bool) {
+        if self.busy() {
+            return;
+        }
         let Some(c) = self.controller.as_mut() else {
             return;
         };
@@ -463,6 +472,9 @@ impl App {
     }
 
     fn toggle_pbp(&mut self) {
+        if self.busy() {
+            return;
+        }
         let Some(c) = self.controller.as_mut() else {
             return;
         };
@@ -474,7 +486,7 @@ impl App {
     }
 
     fn swap_sides(&mut self) {
-        if self.levels.pbp != Some(true) {
+        if self.levels.pbp != Some(true) || self.busy() {
             return;
         }
         let Some(c) = self.controller.as_mut() else {
@@ -490,6 +502,9 @@ impl App {
 
     /// Applies a choice from the split-screen menu and saves it.
     fn choose_split(&mut self, choice: SplitChoice) {
+        if self.busy() {
+            return;
+        }
         let Some(c) = self.controller.as_mut() else {
             return;
         };
@@ -581,6 +596,15 @@ impl App {
         items
     }
 
+    /// Whether a multi-step change is still running. Other monitor changes
+    /// are refused until it finishes, so they can't interleave with it.
+    fn busy(&self) -> bool {
+        if self.job.is_some() {
+            log!("Still applying the last change; try again in a few seconds");
+        }
+        self.job.is_some()
+    }
+
     fn start_job(&mut self, steps: Vec<Step>, action: String) {
         if self.job.is_some() || steps.is_empty() {
             return;
@@ -595,8 +619,12 @@ impl App {
     /// Runs the next step of the current job. Returns the delay before the
     /// following step, if any.
     fn run_job_step(&mut self) -> Option<u32> {
+        let Some(c) = self.controller.as_mut() else {
+            // The config was reloaded with an error; drop the change.
+            self.job = None;
+            return None;
+        };
         let job = self.job.as_mut()?;
-        let c = self.controller.as_mut()?;
         let step = job.steps.pop_front()?;
         let result = c.run_step(step);
         if result.is_ok() && !job.steps.is_empty() {

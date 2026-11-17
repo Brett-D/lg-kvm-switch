@@ -44,8 +44,10 @@ use windows_sys::Win32::System::Registry::{
 };
 use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE,
-    TRACKMOUSEEVENT, VK_ESCAPE, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON,
+    GetAsyncKeyState, GetKeyState, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent,
+    TME_LEAVE, TRACKMOUSEEVENT, VK_APPS, VK_DOWN, VK_END, VK_ESCAPE, VK_F10, VK_HOME, VK_LBUTTON,
+    VK_LEFT, VK_MBUTTON, VK_NEXT, VK_PRIOR, VK_RBUTTON, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE,
+    VK_TAB, VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, GetClientRect, GetCursorPos, GetForegroundWindow, GetWindowRect, KillTimer,
@@ -53,8 +55,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CS_DROPSHADOW, HWND_TOPMOST, IDC_ARROW, SPI_SETWORKAREA, SWP_NOACTIVATE, SWP_NOSIZE,
     SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, WA_INACTIVE, WM_ACTIVATE, WM_CAPTURECHANGED,
     WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW,
-    WNDPROC, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_SYSKEYDOWN, WM_TIMER,
+    WNDCLASSW, WNDPROC, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -340,6 +342,20 @@ fn settings_rect() -> D2D_RECT_F {
     )
 }
 
+/// Everything keyboard focus can land on, in Tab order: enabled tiles, then
+/// each slider's icon button and track, then the settings button.
+fn focus_order(model: &Model) -> Vec<Hit> {
+    let tiles = (0..model.tiles.len())
+        .filter(|&i| model.tiles[i].enabled)
+        .map(Hit::Tile);
+    let sliders = model.sliders.iter().enumerate().flat_map(|(i, s)| {
+        let icon = s.icon_button.then_some(Hit::Icon(i));
+        let track = s.value.is_some().then_some(Hit::Track(i));
+        icon.into_iter().chain(track)
+    });
+    tiles.chain(sliders).chain([Hit::Settings]).collect()
+}
+
 fn slider_value(x: f32) -> u16 {
     let fraction = ((x - TRACK_LEFT) / (TRACK_RIGHT - TRACK_LEFT)).clamp(0.0, 1.0);
     (fraction * 100.0).round() as u16
@@ -456,12 +472,18 @@ impl Painter<'_> {
     }
 
     fn outline(&self, r: D2D_RECT_F, radius: f32, stroke: D2D1_COLOR_F) {
+        self.stroke(r, radius, stroke, 1.0);
+    }
+
+    /// Draws a rounded outline `width` thick, inside `r`.
+    fn stroke(&self, r: D2D_RECT_F, radius: f32, stroke: D2D1_COLOR_F, width: f32) {
+        let half = width / 2.0;
         let inset = D2D1_ROUNDED_RECT {
             rect: rect(
-                r.left + 0.5,
-                r.top + 0.5,
-                r.right - r.left - 1.0,
-                r.bottom - r.top - 1.0,
+                r.left + half,
+                r.top + half,
+                r.right - r.left - width,
+                r.bottom - r.top - width,
             ),
             radiusX: radius,
             radiusY: radius,
@@ -470,7 +492,7 @@ impl Painter<'_> {
         unsafe {
             self.brush.SetColor(&stroke);
             self.target
-                .DrawRoundedRectangle(&inset, self.brush, 1.0, None);
+                .DrawRoundedRectangle(&inset, self.brush, width, None);
         }
     }
 
@@ -518,6 +540,8 @@ pub struct Flyout {
     hidden_at: Option<Instant>,
     hover: Hit,
     pressed: Hit,
+    /// Keyboard focus; shown only after a key is used, as in Windows.
+    focus: Option<Hit>,
     tracking_leave: bool,
     dragging: Option<usize>,
     pending: Option<(usize, u16)>,
@@ -582,6 +606,7 @@ impl Flyout {
                 hidden_at: None,
                 hover: Hit::None,
                 pressed: Hit::None,
+                focus: None,
                 tracking_leave: false,
                 dragging: None,
                 pending: None,
@@ -610,6 +635,7 @@ impl Flyout {
         self.theme = Theme::current();
         self.hover = Hit::None;
         self.pressed = Hit::None;
+        self.focus = None;
         // SAFETY: plain Win32 calls on our own window.
         unsafe {
             let dark = u32::from(self.theme.dark);
@@ -794,6 +820,72 @@ impl Flyout {
         Hit::None
     }
 
+    fn move_focus(&mut self, forward: bool) {
+        let order = focus_order(&self.model);
+        let n = order.len();
+        let next = match self.focus.and_then(|f| order.iter().position(|&h| h == f)) {
+            Some(i) if forward => (i + 1) % n,
+            Some(i) => (i + n - 1) % n,
+            None if forward => 0,
+            None => n - 1,
+        };
+        self.focus = Some(order[next]);
+        self.invalidate();
+    }
+
+    /// Opens the options of the focused tile, if it has any.
+    fn focused_menu(&self) -> Option<Action> {
+        match self.focus? {
+            Hit::Tile(i) if self.model.tiles.get(i)?.has_menu => Some(Action::TileMenu(i)),
+            _ => None,
+        }
+    }
+
+    /// Keyboard use: Tab and the arrows move focus, Enter or Space activates,
+    /// the arrows, Page Up/Down, Home, and End adjust a focused slider, and
+    /// the Menu key or Shift+F10 opens a tile's options.
+    fn key(&mut self, vk: u16, repeat: bool) -> Option<Action> {
+        // SAFETY: reads the calling thread's keyboard state.
+        let shift = unsafe { GetKeyState(i32::from(VK_SHIFT)) } < 0;
+        match vk {
+            VK_ESCAPE => self.hide(),
+            VK_TAB => {
+                self.move_focus(!shift);
+                None
+            }
+            VK_RETURN | VK_SPACE if repeat => None,
+            VK_RETURN | VK_SPACE => match self.focus? {
+                Hit::Tile(i) if self.model.tiles.get(i)?.enabled => Some(Action::Tile(i)),
+                Hit::Icon(i) if self.model.sliders.get(i)?.icon_button => Some(Action::Icon(i)),
+                Hit::Settings => Some(Action::Settings),
+                _ => None,
+            },
+            VK_APPS => self.focused_menu(),
+            VK_F10 if shift => self.focused_menu(),
+            _ => {
+                if let Some(Hit::Track(i)) = self.focus {
+                    let value = self.model.sliders.get(i)?.value?;
+                    let next = match vk {
+                        VK_LEFT | VK_DOWN => value.saturating_sub(1),
+                        VK_RIGHT | VK_UP => (value + 1).min(100),
+                        VK_NEXT => value.saturating_sub(10),
+                        VK_PRIOR => (value + 10).min(100),
+                        VK_HOME => 0,
+                        VK_END => 100,
+                        _ => return None,
+                    };
+                    return self.set_slider(i, next);
+                }
+                match vk {
+                    VK_LEFT | VK_UP => self.move_focus(false),
+                    VK_RIGHT | VK_DOWN => self.move_focus(true),
+                    _ => {}
+                }
+                None
+            }
+        }
+    }
+
     /// Records a slider value and returns an action if it's time to send it.
     fn set_slider(&mut self, i: usize, value: u16) -> Option<Action> {
         let slider = self.model.sliders.get_mut(i)?;
@@ -872,9 +964,19 @@ impl Flyout {
                 (Some(0), None)
             }
             WM_ERASEBKGND => (Some(1), None),
-            WM_DPICHANGED => (Some(0), None),
+            WM_DPICHANGED => {
+                // The scale changed while open: resize and redraw at the new DPI.
+                if self.visible {
+                    self.place(false);
+                }
+                (Some(0), None)
+            }
             WM_ACTIVATE if (wparam & 0xFFFF) as u32 == WA_INACTIVE => (Some(0), self.hide()),
-            WM_KEYDOWN if wparam == VK_ESCAPE as usize => (Some(0), self.hide()),
+            WM_KEYDOWN => {
+                let repeat = lparam & (1 << 30) != 0;
+                (Some(0), self.key(wparam as u16, repeat))
+            }
+            WM_SYSKEYDOWN if wparam == usize::from(VK_F10) => (Some(0), self.key(VK_F10, false)),
             WM_TIMER if wparam == SLIDE_TIMER => {
                 self.step_slide();
                 (Some(0), None)
@@ -920,6 +1022,7 @@ impl Flyout {
                 let (x, y) = point_from(lparam);
                 let (x, y) = self.to_dips(x, y);
                 self.pressed = self.hit(x, y);
+                self.focus = None;
                 self.invalidate();
                 if let Hit::Track(i) = self.pressed {
                     if self.model.sliders.get(i).is_some_and(|s| s.value.is_some()) {
@@ -1226,6 +1329,24 @@ impl Flyout {
             settings,
             color(t.text, 1.0),
         );
+
+        if let Some(focus) = self.focus.filter(|f| focus_order(&self.model).contains(f)) {
+            let ring = match focus {
+                Hit::Tile(i) => {
+                    let r = tile_rect(i);
+                    rect(r.left - 3.0, r.top - 3.0, TILE_W + 6.0, TILE_H + 6.0)
+                }
+                Hit::Track(i) => rect(
+                    TRACK_LEFT - 10.0,
+                    track_y(i) - 14.0,
+                    TRACK_RIGHT - TRACK_LEFT + 20.0,
+                    28.0,
+                ),
+                Hit::Icon(i) => icon_rect(i),
+                _ => settings,
+            };
+            p.stroke(ring, 6.0, color(t.text, 1.0), 2.0);
+        }
     }
 }
 
@@ -1243,5 +1364,33 @@ mod tests {
     #[test]
     fn converts_colors_for_dwm() {
         assert_eq!(colorref(0x123456), 0x563412);
+    }
+
+    #[test]
+    fn tab_order_skips_disabled_tiles_and_unreported_sliders() {
+        let tile = |enabled| Tile {
+            enabled,
+            ..Tile::default()
+        };
+        let slider = |value, icon_button| Slider {
+            value,
+            icon_button,
+            ..Slider::default()
+        };
+        let model = Model {
+            tiles: vec![tile(true), tile(false), tile(true)],
+            sliders: vec![slider(Some(50), false), slider(None, true)],
+            status: String::new(),
+        };
+        assert_eq!(
+            focus_order(&model),
+            vec![
+                Hit::Tile(0),
+                Hit::Tile(2),
+                Hit::Track(0),
+                Hit::Icon(1),
+                Hit::Settings
+            ]
+        );
     }
 }

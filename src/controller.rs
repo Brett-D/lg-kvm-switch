@@ -60,6 +60,8 @@ pub struct Controller {
     started: bool,
     /// Input last selected; in Picture-by-Picture, the one on the left.
     main_input: Option<u16>,
+    /// Whether a switch is waiting for split screen to end (logged once).
+    deferred: bool,
     settle: Duration,
     pub auto: bool,
     pub kvm_here: Option<bool>,
@@ -74,6 +76,7 @@ impl Controller {
             acted_on: None,
             started: false,
             main_input: None,
+            deferred: false,
             settle: SETTLE,
             auto: true,
             kvm_here: None,
@@ -107,7 +110,9 @@ impl Controller {
         self.main_input = Some(self.target(here));
     }
 
-    /// Acts on the current KVM position. Call once USB changes have settled.
+    /// Acts on the current KVM position. Call once USB changes have settled,
+    /// and again every few seconds while it returns
+    /// [`Outcome::PictureByPicture`] or [`Outcome::Failed`].
     pub fn update(&mut self, here: bool) -> Outcome {
         if self.kvm_here != Some(here) {
             log!(
@@ -118,6 +123,7 @@ impl Controller {
                     "another computer"
                 }
             );
+            self.deferred = false;
         }
         self.kvm_here = Some(here);
         if self.acted_on == Some(here) {
@@ -145,11 +151,16 @@ impl Controller {
         }
         self.started = true;
         if self.pbp() == Some(true) {
-            log!("Split screen is on; leaving inputs alone");
+            if !self.deferred {
+                self.deferred = true;
+                log!("Split screen is on; leaving inputs alone");
+            }
             return Outcome::PictureByPicture;
         }
+        self.deferred = false;
         if current == Some(target) {
             self.acted_on = Some(here);
+            self.last_error = None;
             log!("The monitor already shows {}", input_name(target));
             return Outcome::AlreadyShown(target);
         }
@@ -293,18 +304,26 @@ impl Controller {
 
     /// Runs one step and updates what the controller knows about the monitor.
     pub fn run_step(&mut self, step: Step) -> Result<(), String> {
+        let target = self.kvm_here.map(|here| (here, self.target(here)));
         match step {
             Step::Input(input) => {
                 self.monitor.set_input(input)?;
                 self.main_input = Some(input);
+                // Completes turning split screen off (see below).
+                if let Some((here, target)) = target {
+                    if self.acted_on.is_none() && input == target {
+                        self.acted_on = Some(here);
+                    }
+                }
             }
             Step::Layout(layout) => {
                 self.monitor.set_vcp(lg::LG_PBP_VCP, layout)?;
                 if layout == lg::PBP_OFF {
-                    // Full screen again: the KVM position is now handled.
-                    if let Some(here) = self.kvm_here {
-                        self.acted_on = Some(here);
+                    // Full screen again. The KVM position is handled once its
+                    // input shows; until then, `update` retries it.
+                    if let Some((here, target)) = target {
                         self.started = true;
+                        self.acted_on = (self.main_input == Some(target)).then_some(here);
                     }
                 }
             }
@@ -629,6 +648,49 @@ mod tests {
         assert_eq!(r.controller.update(false), Outcome::PictureByPicture);
         assert_eq!(r.controller.levels().layout, Some(lg::PBP_PIP));
         assert!(r.inputs().is_empty());
+    }
+
+    #[test]
+    fn applies_a_deferred_switch_once_split_screen_ends() {
+        let mut r = rig();
+        r.controller.update(true);
+        r.values
+            .borrow_mut()
+            .insert(lg::LG_PBP_VCP, lg::PBP_SIDE_BY_SIDE);
+        assert_eq!(r.controller.update(false), Outcome::PictureByPicture);
+        assert_eq!(r.controller.update(false), Outcome::PictureByPicture);
+        // Split screen is turned off from the monitor's menu.
+        r.values.borrow_mut().insert(lg::LG_PBP_VCP, lg::PBP_OFF);
+        assert_eq!(r.controller.update(false), Outcome::Switched(0xD1));
+    }
+
+    #[test]
+    fn retries_when_turning_pbp_off_fails_to_select_the_input() {
+        let mut r = rig();
+        r.controller.update(true);
+        r.controller.set_pbp(true).unwrap();
+        // USB-C is on the left, so turning PBP off must then select DisplayPort.
+        let steps = r.controller.pbp_steps(false);
+        assert_eq!(steps, vec![Step::Layout(lg::PBP_OFF), Step::Input(0xD0)]);
+        r.controller.run_step(steps[0]).unwrap();
+        *r.fail.borrow_mut() = true;
+        assert!(r.controller.run_step(steps[1]).is_err());
+        *r.fail.borrow_mut() = false;
+        assert_eq!(r.controller.update(true), Outcome::Switched(0xD0));
+    }
+
+    #[test]
+    fn clears_the_error_when_the_input_turns_out_to_be_shown() {
+        let mut r = rig();
+        r.values.borrow_mut().insert(lg::LG_ACTIVE_INPUT_VCP, 1);
+        r.controller.update(true);
+        *r.fail.borrow_mut() = true;
+        assert!(matches!(r.controller.update(false), Outcome::Failed(_)));
+        *r.fail.borrow_mut() = false;
+        // The switch landed anyway, or someone picked USB-C on the monitor.
+        r.values.borrow_mut().insert(lg::LG_ACTIVE_INPUT_VCP, 2);
+        assert_eq!(r.controller.update(false), Outcome::AlreadyShown(0xD1));
+        assert_eq!(r.controller.last_error, None);
     }
 
     #[test]
