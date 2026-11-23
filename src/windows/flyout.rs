@@ -45,9 +45,9 @@ use windows_sys::Win32::System::Registry::{
 use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetKeyState, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent,
-    TME_LEAVE, TRACKMOUSEEVENT, VK_APPS, VK_DOWN, VK_END, VK_ESCAPE, VK_F10, VK_HOME, VK_LBUTTON,
-    VK_LEFT, VK_MBUTTON, VK_NEXT, VK_PRIOR, VK_RBUTTON, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE,
-    VK_TAB, VK_UP,
+    TME_LEAVE, TRACKMOUSEEVENT, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LBUTTON, VK_LEFT,
+    VK_MBUTTON, VK_NEXT, VK_PRIOR, VK_RBUTTON, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB,
+    VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, GetClientRect, GetCursorPos, GetForegroundWindow, GetWindowRect, KillTimer,
@@ -55,8 +55,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CS_DROPSHADOW, HWND_TOPMOST, IDC_ARROW, SPI_SETWORKAREA, SWP_NOACTIVATE, SWP_NOSIZE,
     SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, WA_INACTIVE, WM_ACTIVATE, WM_CAPTURECHANGED,
     WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_SYSKEYDOWN, WM_TIMER,
-    WNDCLASSW, WNDPROC, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WNDPROC,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -86,8 +86,6 @@ const SEND_INTERVAL: Duration = Duration::from_millis(120);
 /// A tray click that arrives this soon after the flyout closed is the click
 /// that closed it, so it shouldn't reopen it.
 const REOPEN_GUARD: Duration = Duration::from_millis(400);
-/// Width of the dropdown part of a tile that has options.
-const MENU_ZONE: f32 = 20.0;
 
 const FLUSH_TIMER: usize = 1;
 const SLIDE_TIMER: usize = 2;
@@ -104,7 +102,6 @@ pub const GLYPH_CONTRAST: char = '\u{E793}';
 pub const GLYPH_VOLUME: char = '\u{E767}';
 pub const GLYPH_MUTED: char = '\u{E74F}';
 const GLYPH_SETTINGS: char = '\u{E713}';
-const GLYPH_CHEVRON: char = '\u{E70D}';
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Tile {
@@ -112,8 +109,6 @@ pub struct Tile {
     pub label: String,
     pub on: bool,
     pub enabled: bool,
-    /// Right-clicking opens a menu of options; shown with a small chevron.
-    pub has_menu: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -138,8 +133,6 @@ pub struct Model {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     Tile(usize),
-    /// Right-click on a tile that has options.
-    TileMenu(usize),
     SetLevel(usize, u16),
     Icon(usize),
     /// The settings button.
@@ -150,8 +143,6 @@ pub enum Action {
 enum Hit {
     None,
     Tile(usize),
-    /// The dropdown part on the right of a tile that has options.
-    TileMenu(usize),
     Track(usize),
     Icon(usize),
     Settings,
@@ -375,7 +366,6 @@ struct Fonts {
     status: IDWriteTextFormat,
     caption: IDWriteTextFormat,
     icon: IDWriteTextFormat,
-    small_icon: IDWriteTextFormat,
 }
 
 impl Fonts {
@@ -438,12 +428,6 @@ impl Fonts {
             icon: make(
                 icons,
                 16.0,
-                DWRITE_FONT_WEIGHT_NORMAL,
-                DWRITE_TEXT_ALIGNMENT_CENTER,
-            )?,
-            small_icon: make(
-                icons,
-                8.0,
                 DWRITE_FONT_WEIGHT_NORMAL,
                 DWRITE_TEXT_ALIGNMENT_CENTER,
             )?,
@@ -614,10 +598,6 @@ impl Flyout {
                 slide: None,
             })
         }
-    }
-
-    pub fn hwnd(&self) -> HWND {
-        self.hwnd
     }
 
     pub fn is_visible(&self) -> bool {
@@ -798,9 +778,6 @@ impl Flyout {
 
     fn hit(&self, x: f32, y: f32) -> Hit {
         if let Some(i) = (0..self.model.tiles.len()).find(|&i| contains(&tile_rect(i), x, y)) {
-            if self.model.tiles[i].has_menu && x >= tile_rect(i).right - MENU_ZONE {
-                return Hit::TileMenu(i);
-            }
             return Hit::Tile(i);
         }
         for i in 0..self.model.sliders.len() {
@@ -833,17 +810,8 @@ impl Flyout {
         self.invalidate();
     }
 
-    /// Opens the options of the focused tile, if it has any.
-    fn focused_menu(&self) -> Option<Action> {
-        match self.focus? {
-            Hit::Tile(i) if self.model.tiles.get(i)?.has_menu => Some(Action::TileMenu(i)),
-            _ => None,
-        }
-    }
-
     /// Keyboard use: Tab and the arrows move focus, Enter or Space activates,
-    /// the arrows, Page Up/Down, Home, and End adjust a focused slider, and
-    /// the Menu key or Shift+F10 opens a tile's options.
+    /// and the arrows, Page Up/Down, Home, and End adjust a focused slider.
     fn key(&mut self, vk: u16, repeat: bool) -> Option<Action> {
         // SAFETY: reads the calling thread's keyboard state.
         let shift = unsafe { GetKeyState(i32::from(VK_SHIFT)) } < 0;
@@ -860,8 +828,6 @@ impl Flyout {
                 Hit::Settings => Some(Action::Settings),
                 _ => None,
             },
-            VK_APPS => self.focused_menu(),
-            VK_F10 if shift => self.focused_menu(),
             _ => {
                 if let Some(Hit::Track(i)) = self.focus {
                     let value = self.model.sliders.get(i)?.value?;
@@ -976,7 +942,6 @@ impl Flyout {
                 let repeat = lparam & (1 << 30) != 0;
                 (Some(0), self.key(wparam as u16, repeat))
             }
-            WM_SYSKEYDOWN if wparam == usize::from(VK_F10) => (Some(0), self.key(VK_F10, false)),
             WM_TIMER if wparam == SLIDE_TIMER => {
                 self.step_slide();
                 (Some(0), None)
@@ -1049,20 +1014,8 @@ impl Flyout {
                 }
                 let action = match pressed {
                     Hit::Tile(i) if self.model.tiles[i].enabled => Some(Action::Tile(i)),
-                    Hit::TileMenu(i) => Some(Action::TileMenu(i)),
                     Hit::Icon(i) if self.model.sliders[i].icon_button => Some(Action::Icon(i)),
                     Hit::Settings => Some(Action::Settings),
-                    _ => None,
-                };
-                (Some(0), action)
-            }
-            WM_RBUTTONUP => {
-                let (x, y) = point_from(lparam);
-                let (x, y) = self.to_dips(x, y);
-                let action = match self.hit(x, y) {
-                    Hit::Tile(i) | Hit::TileMenu(i) if self.model.tiles[i].has_menu => {
-                        Some(Action::TileMenu(i))
-                    }
                     _ => None,
                 };
                 (Some(0), action)
@@ -1183,15 +1136,10 @@ impl Flyout {
                 p.outline(r, 4.0, color(t.tile_border, alpha));
             }
             let glyph_color = if tile.on { t.on_accent } else { t.text };
-            let main = if tile.has_menu {
-                rect(r.left, r.top, TILE_W - MENU_ZONE, TILE_H)
-            } else {
-                r
-            };
             p.text(
                 &tile.glyph.to_string(),
                 &fonts.icon,
-                main,
+                r,
                 color(glyph_color, alpha),
             );
             p.text(
@@ -1200,30 +1148,6 @@ impl Flyout {
                 rect(r.left - 6.0, r.bottom + 4.0, TILE_W + 12.0, 18.0),
                 color(t.text, alpha),
             );
-            if tile.has_menu {
-                // A split button: the right part opens the options menu.
-                let zone = rect(r.right - MENU_ZONE, r.top, MENU_ZONE, TILE_H);
-                if self.hover == Hit::TileMenu(i) {
-                    let inset = rect(zone.left, zone.top + 1.0, MENU_ZONE - 1.0, TILE_H - 2.0);
-                    let fill = if tile.on {
-                        color(t.on_accent, 0.12)
-                    } else {
-                        color(t.tile_hover, 1.0)
-                    };
-                    p.fill(inset, 3.0, fill);
-                }
-                p.fill(
-                    rect(zone.left, r.top + 12.0, 1.0, TILE_H - 24.0),
-                    0.0,
-                    color(glyph_color, 0.25),
-                );
-                p.text(
-                    &GLYPH_CHEVRON.to_string(),
-                    &fonts.small_icon,
-                    zone,
-                    color(glyph_color, 0.8),
-                );
-            }
         }
 
         for (i, slider) in self.model.sliders.iter().enumerate() {

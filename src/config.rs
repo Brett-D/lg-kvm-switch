@@ -15,10 +15,11 @@ pub struct Config {
     pub watch_devices: Vec<String>,
     pub local_input: String,
     pub remote_input: String,
-    /// Input on the left half in split screen; defaults to `remote_input`.
+    /// Which KVM input is on the left in split screen, saved by Swap sides.
+    /// Split screen always shows `local_input` and `remote_input`; other
+    /// inputs here are ignored. Defaults to `remote_input` on the left.
     pub pbp_left: Option<String>,
-    /// Input on the right half in split screen; defaults to the other of
-    /// `local_input` and `remote_input`.
+    /// The KVM input on the right in split screen; see `pbp_left`.
     pub pbp_right: Option<String>,
     pub debounce_ms: u64,
     pub monitor_vendor: String,
@@ -50,7 +51,8 @@ pub struct Settings {
     pub watch: Vec<UsbId>,
     pub local_input: u16,
     pub remote_input: u16,
-    /// Inputs on the left and right halves in split screen.
+    /// Inputs on the left and right halves in split screen: `local_input`
+    /// and `remote_input`, in either order.
     pub pbp_left: u16,
     pub pbp_right: u16,
     pub debounce: Duration,
@@ -75,18 +77,23 @@ impl Config {
         if local_input == remote_input {
             return Err("local_input and remote_input must be different".into());
         }
-        let pbp_left = match &self.pbp_left {
-            Some(text) => lg::parse_input(text).map_err(|e| format!("pbp_left: {e}"))?,
-            None => remote_input,
+        let side = |name: &str, text: &Option<String>| {
+            text.as_deref()
+                .map(|t| lg::parse_input(t).map_err(|e| format!("{name}: {e}")))
+                .transpose()
         };
-        let pbp_right = match &self.pbp_right {
-            Some(text) => lg::parse_input(text).map_err(|e| format!("pbp_right: {e}"))?,
-            None if pbp_left == local_input => remote_input,
-            None => local_input,
+        let left = side("pbp_left", &self.pbp_left)?;
+        let right = side("pbp_right", &self.pbp_right)?;
+        // Split screen always shows the two KVM inputs; the config only says
+        // which is on the left. Other inputs, as set by older versions, are
+        // ignored.
+        let local_left = left == Some(local_input)
+            || (left != Some(remote_input) && right == Some(remote_input));
+        let (pbp_left, pbp_right) = if local_left {
+            (local_input, remote_input)
+        } else {
+            (remote_input, local_input)
         };
-        if pbp_left == pbp_right {
-            return Err("pbp_left and pbp_right must be different inputs".into());
-        }
         let monitor_product = self
             .monitor_product
             .as_deref()
@@ -148,8 +155,9 @@ watch_devices = [{watch}]
 local_input = {local}
 remote_input = {remote}
 
-# Split screen (side by side): the inputs on the left and right halves.
-# Default to remote_input on the left and local_input on the right.
+# Split screen (side by side) shows local_input and remote_input. These say
+# which one is on the left; Swap sides in the tray app saves them. Defaults to
+# remote_input on the left. Other inputs here are ignored.
 # Picture-in-picture can only be turned on from the monitor's own menu.
 {pbp_left}
 {pbp_right}
@@ -238,7 +246,7 @@ mod tests {
         let config = Config {
             watch_devices: vec!["FC32:1287".into(), "046D:C07D".into()],
             pbp_left: Some("dp".into()),
-            pbp_right: Some("hdmi1".into()),
+            pbp_right: Some("usbc".into()),
             monitor_product: Some("9E9D".into()),
             i2c_bus: Some(r"/dev/i2c-5".into()),
             ..Config::default()
@@ -277,27 +285,29 @@ mod tests {
     }
 
     #[test]
-    fn split_sides_default_to_remote_left_and_local_right() {
-        let settings = Config::default().settings().unwrap();
-        assert_eq!((settings.pbp_left, settings.pbp_right), (0xD1, 0xD0));
-        let local_left = Config {
-            pbp_left: Some("dp".into()),
+    fn split_sides_are_the_kvm_inputs_remote_left_by_default() {
+        let sides = |left: Option<&str>, right: Option<&str>| {
+            let settings = Config {
+                pbp_left: left.map(Into::into),
+                pbp_right: right.map(Into::into),
+                ..Config::default()
+            }
+            .settings()
+            .unwrap();
+            (settings.pbp_left, settings.pbp_right)
+        };
+        assert_eq!(sides(None, None), (0xD1, 0xD0));
+        assert_eq!(sides(Some("dp"), None), (0xD0, 0xD1));
+        assert_eq!(sides(None, Some("usbc")), (0xD0, 0xD1));
+        // Other inputs, from the removed side picker, are ignored.
+        assert_eq!(sides(Some("hdmi1"), Some("dp")), (0xD1, 0xD0));
+        assert_eq!(sides(Some("hdmi1"), Some("usbc")), (0xD0, 0xD1));
+        assert_eq!(sides(Some("dp"), Some("dp")), (0xD0, 0xD1));
+        let bad = Config {
+            pbp_left: Some("vga".into()),
             ..Config::default()
         };
-        let settings = local_left.settings().unwrap();
-        assert_eq!((settings.pbp_left, settings.pbp_right), (0xD0, 0xD1));
-        let hdmi = Config {
-            pbp_left: Some("hdmi1".into()),
-            ..Config::default()
-        };
-        let settings = hdmi.settings().unwrap();
-        assert_eq!((settings.pbp_left, settings.pbp_right), (0x90, 0xD0));
-        let same = Config {
-            pbp_left: Some("dp".into()),
-            pbp_right: Some("dp".into()),
-            ..Config::default()
-        };
-        assert!(same.settings().is_err());
+        assert!(bad.settings().is_err());
     }
 
     #[test]

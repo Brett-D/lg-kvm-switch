@@ -238,18 +238,6 @@ impl Controller {
             .map(|layout| layout != lg::PBP_OFF)
     }
 
-    /// Steps that put `left` and `right` on the two pictures of an active
-    /// split. Selecting an input moves it to the left (main) picture and the
-    /// previous one to the right, so select the right-hand input first.
-    fn side_steps(&self, left: u16, right: u16) -> Vec<Step> {
-        let mut steps = Vec::new();
-        if self.main_input != Some(right) {
-            steps.push(Step::Input(right));
-        }
-        steps.push(Step::Input(left));
-        steps
-    }
-
     /// Steps that turn side-by-side split screen on with the configured
     /// sides, or off, showing the KVM's position full screen.
     pub fn pbp_steps(&mut self, on: bool) -> Vec<Step> {
@@ -287,19 +275,6 @@ impl Controller {
         };
         (s.pbp_left, s.pbp_right) = (right, left);
         (Step::Input(right), right)
-    }
-
-    /// Changes the split-screen sides. Returns the steps that apply the
-    /// change if split screen is on.
-    pub fn set_split(&mut self, left: u16, right: u16) -> Vec<Step> {
-        let old = (self.settings.pbp_left, self.settings.pbp_right);
-        self.settings.pbp_left = left;
-        self.settings.pbp_right = right;
-        if (left, right) == old || self.pbp() != Some(true) {
-            return Vec::new();
-        }
-        self.sync_main_input();
-        self.side_steps(left, right)
     }
 
     /// Runs one step and updates what the controller knows about the monitor.
@@ -618,26 +593,6 @@ mod tests {
         assert_eq!(r.controller.update(true), Outcome::AlreadyShown(0xD0));
         assert_eq!(r.inputs(), vec![0xD0, 0xD1]);
         assert!(r.controller.show_steps(0xD0).is_empty());
-    }
-
-    #[test]
-    fn changes_split_sides_while_on() {
-        let mut r = rig();
-        r.controller.update(true);
-        r.controller.set_pbp(true).unwrap();
-        r.ops.borrow_mut().clear();
-        // USB-C is on the left; put DisplayPort there.
-        let steps = r.controller.set_split(0xD0, 0xD1);
-        assert_eq!(steps, vec![Step::Input(0xD0)]);
-        assert!(r.controller.set_split(0xD0, 0xD1).is_empty());
-
-        r.controller.set_pbp(false).unwrap();
-        assert!(r.controller.set_split(0xD1, 0xD0).is_empty());
-        // Off shows DisplayPort (the KVM is here), which is already the right side.
-        assert_eq!(
-            r.controller.pbp_steps(true),
-            vec![Step::Layout(lg::PBP_SIDE_BY_SIDE), Step::Input(0xD1)]
-        );
     }
 
     #[test]
