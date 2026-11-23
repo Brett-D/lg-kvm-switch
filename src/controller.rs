@@ -264,23 +264,26 @@ impl Controller {
 
     /// Swaps the two pictures and keeps the new order for next time. Returns
     /// the steps and the new left input. Selecting an input moves it to the
-    /// left picture and the previous one to the right, so this is usually
-    /// one step; if split screen shows an input other than the two KVM
-    /// inputs, both are selected so the split shows them again.
+    /// left picture and the previous one to the right, so this is one step
+    /// when the monitor reports showing a KVM input. Otherwise (another
+    /// input, or one it can't report, such as HDMI) both are selected so the
+    /// split shows the two KVM inputs again.
     pub fn swap_pbp(&mut self) -> (Vec<Step>, u16) {
-        self.sync_main_input();
+        let current = self.sync_main_input();
         let s = &mut self.settings;
         let pair = [s.pbp_left, s.pbp_right];
-        let other_input = self.main_input.is_some_and(|i| !pair.contains(&i));
-        let shown = self.main_input.filter(|i| pair.contains(i));
-        let (left, right) = if shown.unwrap_or(s.pbp_left) == s.pbp_left {
+        let known = current.filter(|i| pair.contains(i));
+        let shown = known
+            .or(self.main_input.filter(|i| pair.contains(i)))
+            .unwrap_or(s.pbp_left);
+        let (left, right) = if shown == s.pbp_left {
             (s.pbp_right, s.pbp_left)
         } else {
             (s.pbp_left, s.pbp_right)
         };
         (s.pbp_left, s.pbp_right) = (left, right);
         let mut steps = Vec::new();
-        if other_input {
+        if known.is_none() {
             steps.push(Step::Input(right));
         }
         steps.push(Step::Input(left));
@@ -664,12 +667,25 @@ mod tests {
     #[test]
     fn swapping_selects_the_right_input_and_remembers_it() {
         let mut r = rig();
+        r.values.borrow_mut().insert(lg::LG_ACTIVE_INPUT_VCP, 1);
         r.controller.update(true);
         r.controller.set_pbp(true).unwrap();
         assert_eq!(r.controller.swap_pbp(), (vec![Step::Input(0xD0)], 0xD0));
         r.controller.run_step(Step::Input(0xD0)).unwrap();
         assert_eq!(r.controller.settings().pbp_left, 0xD0);
         assert_eq!(r.controller.swap_pbp(), (vec![Step::Input(0xD1)], 0xD1));
+    }
+
+    #[test]
+    fn swapping_from_an_unreported_input_selects_both_kvm_inputs() {
+        // The monitor doesn't say what it shows (e.g. HDMI on the left).
+        let mut r = rig();
+        r.controller.update(true);
+        r.controller.set_pbp(true).unwrap();
+        assert_eq!(
+            r.controller.swap_pbp(),
+            (vec![Step::Input(0xD1), Step::Input(0xD0)], 0xD0)
+        );
     }
 
     #[test]
