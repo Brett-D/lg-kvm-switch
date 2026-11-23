@@ -97,8 +97,8 @@ attached to each CI run.
    watch_devices = ["FC32:1287", "046D:C07D"]  # keyboard, mouse
    local_input = "dp"     # this computer
    remote_input = "usbc"  # the other computer
-   pbp_left = "usbc"      # left half in Picture-by-Picture (optional)
-   pbp_right = "dp"       # right half (optional)
+   pbp_left = "usbc"      # which KVM input is on the left in split screen (optional)
+   pbp_right = "dp"       # and on the right (optional; Swap sides saves both)
    ```
 
 3. Check that the monitor is reachable, then switch it once to confirm:
@@ -122,23 +122,21 @@ Left-click the icon for the flyout. It follows your light or dark theme and
 accent color:
 
 - **This PC** / **Other PC**: show that computer full screen.
-- **Side by side**: Picture-by-Picture, with `pbp_left` on the left and
-  `pbp_right` on the right. Automatic switching waits while it's on, since
-  both computers are visible. Click the tile's arrow (or right-click the tile)
-  to choose the input for each side.
+- **Side by side**: Picture-by-Picture with both KVM computers
+  (`local_input` and `remote_input`), `pbp_left` on the left. Automatic
+  switching waits while it's on, since both computers are visible.
 - **Swap sides**: swap the halves, and remember the order for next time.
 - **Auto switch**: pause or resume following the KVM.
 - **Brightness**, **Contrast**, and **Volume** sliders; click the speaker to
   mute.
 
 Keyboard: Tab or the arrow keys move between controls, Enter or Space
-activates one, the arrows, Page Up/Down, Home, and End adjust a slider, and
-the Menu key (or Shift+F10) opens the split-screen options. Pressing Enter on
-the tray icon (Win+B) opens the menu.
+activates one, and the arrows, Page Up/Down, Home, and End adjust a slider.
+Pressing Enter on the tray icon (Win+B) opens the menu.
 
 Right-click the icon (or click the gear in the flyout) for the same actions
-plus **Split screen options**, **Start with Windows**, editing or reloading
-the config, and the log (`%LOCALAPPDATA%\lg-kvm-switch\lg-kvm-switch.log`).
+plus **Start with Windows**, editing or reloading the config, and the log
+(`%LOCALAPPDATA%\lg-kvm-switch\lg-kvm-switch.log`).
 `lg-kvm-switch autostart on` also enables start-at-logon.
 
 You can uninstall LG OnScreen Control; lg-kvm-switch doesn't use it.
