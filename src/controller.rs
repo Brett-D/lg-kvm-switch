@@ -262,19 +262,29 @@ impl Controller {
         steps
     }
 
-    /// Swaps the two pictures by selecting the right-hand input, and keeps
-    /// the new order for next time. Returns the step and the new left input.
-    pub fn swap_pbp(&mut self) -> (Step, u16) {
+    /// Swaps the two pictures and keeps the new order for next time. Returns
+    /// the steps and the new left input. Selecting an input moves it to the
+    /// left picture and the previous one to the right, so this is usually
+    /// one step; if split screen shows an input other than the two KVM
+    /// inputs, both are selected so the split shows them again.
+    pub fn swap_pbp(&mut self) -> (Vec<Step>, u16) {
         self.sync_main_input();
         let s = &mut self.settings;
-        let left = self.main_input.unwrap_or(s.pbp_left);
-        let right = if left == s.pbp_left {
-            s.pbp_right
+        let pair = [s.pbp_left, s.pbp_right];
+        let other_input = self.main_input.is_some_and(|i| !pair.contains(&i));
+        let shown = self.main_input.filter(|i| pair.contains(i));
+        let (left, right) = if shown.unwrap_or(s.pbp_left) == s.pbp_left {
+            (s.pbp_right, s.pbp_left)
         } else {
-            s.pbp_left
+            (s.pbp_left, s.pbp_right)
         };
-        (s.pbp_left, s.pbp_right) = (right, left);
-        (Step::Input(right), right)
+        (s.pbp_left, s.pbp_right) = (left, right);
+        let mut steps = Vec::new();
+        if other_input {
+            steps.push(Step::Input(right));
+        }
+        steps.push(Step::Input(left));
+        (steps, left)
     }
 
     /// Runs one step and updates what the controller knows about the monitor.
@@ -472,10 +482,13 @@ mod tests {
     }
 
     fn rig() -> Rig {
-        let config = Config {
+        rig_with(Config {
             watch_devices: vec!["FC32:1287".into()],
             ..Config::default()
-        };
+        })
+    }
+
+    fn rig_with(config: Config) -> Rig {
         let fake = Fake::default();
         let (ops, values, fail) = (fake.ops.clone(), fake.values.clone(), fake.fail.clone());
         let mut controller = Controller::new(config.settings().unwrap(), Box::new(fake));
@@ -653,10 +666,30 @@ mod tests {
         let mut r = rig();
         r.controller.update(true);
         r.controller.set_pbp(true).unwrap();
-        assert_eq!(r.controller.swap_pbp(), (Step::Input(0xD0), 0xD0));
+        assert_eq!(r.controller.swap_pbp(), (vec![Step::Input(0xD0)], 0xD0));
         r.controller.run_step(Step::Input(0xD0)).unwrap();
         assert_eq!(r.controller.settings().pbp_left, 0xD0);
-        assert_eq!(r.controller.swap_pbp(), (Step::Input(0xD1), 0xD1));
+        assert_eq!(r.controller.swap_pbp(), (vec![Step::Input(0xD1)], 0xD1));
+    }
+
+    #[test]
+    fn swapping_from_another_input_selects_both_kvm_inputs() {
+        let mut r = rig_with(Config {
+            local_input: "hdmi1".into(),
+            remote_input: "usbc".into(),
+            ..Config::default()
+        });
+        // Split screen shows DisplayPort on the left, e.g. set on the monitor.
+        r.values.borrow_mut().extend([
+            (lg::LG_ACTIVE_INPUT_VCP, 1),
+            (lg::LG_PBP_VCP, lg::PBP_SIDE_BY_SIDE),
+        ]);
+        assert_eq!(
+            r.controller.swap_pbp(),
+            (vec![Step::Input(0xD1), Step::Input(0x90)], 0x90)
+        );
+        let s = r.controller.settings();
+        assert_eq!((s.pbp_left, s.pbp_right), (0x90, 0xD1));
     }
 
     #[test]

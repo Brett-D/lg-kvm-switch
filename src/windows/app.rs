@@ -469,9 +469,9 @@ impl App {
         let Some(c) = self.controller.as_mut() else {
             return;
         };
-        let (step, left) = c.swap_pbp();
+        let (steps, left) = c.swap_pbp();
         self.start_job(
-            vec![step],
+            steps,
             format!("swap sides ({} now on the left)", input_name(left)),
         );
         self.save_split();
